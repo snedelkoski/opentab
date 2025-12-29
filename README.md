@@ -98,6 +98,14 @@ pip install tabarena autogluon openml
 
 | Mode | Description | Command |
 |------|-------------|---------|
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to submit pull requests, report issues, and contribute to the project.
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 | `quick` | Test on sklearn classification datasets | `python evaluate.py --mode quick` |
 | `quick-regression` | Test on sklearn regression datasets | `python evaluate.py --mode quick-regression` |
 | `lite` | TabArena-Lite (51 datasets, 1 fold) | `python evaluate.py --mode lite` |
