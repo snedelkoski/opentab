@@ -494,6 +494,7 @@ def compute_elo_ratings(
     """
     try:
         from tabarena.nips2025_utils.end_to_end_single import EndToEndSingle, EndToEndResultsSingle
+        from bencheval.website_format import format_leaderboard
     except ImportError:
         print("\nNote: Could not compute Elo ratings (tabarena end_to_end not available)")
         return None
@@ -512,20 +513,38 @@ def compute_elo_ratings(
             print(f"Warning: Results path not found: {path_raw}")
             return None
         
-        # Process results (this caches them in ~/.cache/tabarena/)
-        print("Processing results...")
-        end_to_end = EndToEndSingle.from_path_raw(path_raw=path_raw)
+        # Process results and cache them
+        # Following the official TabArena pattern from run_evaluate_model.py
+        print("Processing raw results...")
+        end_to_end = EndToEndSingle.from_path_raw(
+            path_raw=path_raw,
+            name=method_name,  # Explicitly set method name
+            cache=True,
+        )
         
-        # Load cached results and compare
-        print("Loading baseline results and computing Elo...")
-        end_to_end_results = EndToEndResultsSingle.from_cache(method=method_name)
+        # Convert to results object
+        end_to_end_results = end_to_end.to_results()
         
-        # Compare on TabArena classification tasks
+        # Compare on TabArena tasks
+        # Using only_valid_tasks=True to compare only on tasks we have results for
         elo_output_dir = eval_dir if eval_dir else Path(output_dir) / "elo"
+        elo_output_dir = Path(elo_output_dir)
+        elo_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print("Computing Elo ratings against TabArena baselines...")
         leaderboard = end_to_end_results.compare_on_tabarena(
             output_dir=elo_output_dir,
-            subset='classification',
+            only_valid_tasks=True,  # Only compare on tasks we ran
+            subset='classification',  # Classification subset
         )
+        
+        # Format leaderboard for display
+        try:
+            leaderboard_formatted = format_leaderboard(leaderboard)
+            print("\nFormatted Leaderboard:")
+            print(leaderboard_formatted.to_markdown(index=False))
+        except Exception:
+            pass  # format_leaderboard may not be available
         
         # Find our method in the leaderboard
         our_row = leaderboard[leaderboard['method'] == method_name]
