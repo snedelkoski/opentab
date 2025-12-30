@@ -30,25 +30,27 @@ MISSING_INDICATOR = -999.0
 class FeatureEncoder(nn.Module):
     """Encodes scalar feature values into dense embeddings.
     
-    Each feature value is normalized based on training statistics,
-    then projected to an embedding space.
+    Following TabPFN exactly:
+    1. NaN handling: Replace NaN/missing with 0, create indicator tensor
+    2. Normalization: Per-feature normalization using training statistics
+    3. Encoding: Linear projection of [value, nan_indicator] to embedding space
+    4. Feature grouping: If features_per_group > 1, group features before encoding
     
-    Following TabPFN, this encoder handles missing values by:
-    1. Detecting missing indicator values (-999.0)
-    2. Using a learned embedding for missing values
-    3. Adding a missing indicator embedding to the feature embedding
+    The encoder takes (value, nan_indicator) pairs and projects to embedding_size.
+    With feature grouping, it takes features_per_group * 2 inputs (values + indicators).
     """
     
-    def __init__(self, embedding_size: int):
+    def __init__(self, embedding_size: int, features_per_group: int = 1):
         super().__init__()
         self.embedding_size = embedding_size
-        self.linear = nn.Linear(1, embedding_size)
+        self.features_per_group = features_per_group
         
-        # Learned embedding for missing values (replaces the feature embedding)
-        self.missing_embedding = nn.Parameter(torch.randn(embedding_size) * 0.02)
-        
-        # Learned indicator that a value is missing (added to embedding)
-        self.missing_indicator_embedding = nn.Parameter(torch.randn(embedding_size) * 0.02)
+        # Linear encoder following TabPFN:
+        # Input: [value, nan_indicator] per feature (or per group of features)
+        # For features_per_group=1: input is 2 (value + indicator)
+        # For features_per_group=N: input is N*2 (N values + N indicators)
+        input_size = features_per_group * 2  # value + nan_indicator for each feature in group
+        self.encoder = nn.Linear(input_size, embedding_size, bias=True)
     
     def forward(
         self, 
@@ -63,26 +65,25 @@ class FeatureEncoder(nn.Module):
             missing_indicator: value used to mark missing data
             
         Returns:
-            (batch, rows, features, embedding_size) tensor of embeddings
+            (batch, rows, n_groups, embedding_size) tensor of embeddings
+            where n_groups = ceil(features / features_per_group)
         """
         batch, rows, features = x.shape
         
-        # Detect missing values (using approximate comparison for float)
-        missing_mask = (x < missing_indicator + 1) & (x > missing_indicator - 1)
+        # Step 1: Detect missing values (using approximate comparison for float)
+        nan_mask = (x < missing_indicator + 1) & (x > missing_indicator - 1)
         
-        # Replace missing values with 0 for normalization computation
+        # Step 2: Replace missing values with 0 for normalization
         x_filled = x.clone()
-        x_filled[missing_mask] = 0.0
+        x_filled[nan_mask] = 0.0
         
-        x_filled = x_filled.unsqueeze(-1)  # (batch, rows, features, 1)
-        
-        # Compute mean and std from training portion only, excluding missing
+        # Step 3: Compute mean and std from training portion only, excluding missing
         train_x = x[:, :train_size]
-        train_missing_mask = missing_mask[:, :train_size]
+        train_nan_mask = nan_mask[:, :train_size]
         
         # Mask out missing values for statistics computation
         train_x_masked = train_x.clone()
-        train_x_masked[train_missing_mask] = float('nan')
+        train_x_masked[train_nan_mask] = float('nan')
         
         # Compute stats ignoring NaN (missing values)
         mean = torch.nanmean(train_x_masked, dim=1, keepdim=True)
@@ -92,30 +93,43 @@ class FeatureEncoder(nn.Module):
         
         # Compute std (handling missing values)
         train_x_centered = train_x_masked - mean
-        train_x_centered[train_missing_mask] = 0.0
-        n_valid = (~train_missing_mask).float().sum(dim=1, keepdim=True).clamp(min=1)
+        train_x_centered[train_nan_mask] = 0.0
+        n_valid = (~train_nan_mask).float().sum(dim=1, keepdim=True).clamp(min=1)
         var = (train_x_centered ** 2).sum(dim=1, keepdim=True) / n_valid
         std = torch.sqrt(var + 1e-8)
         
-        # Normalize all data (train + test) using training statistics
-        x_normalized = (x_filled - mean.unsqueeze(-1)) / std.unsqueeze(-1)
+        # Step 4: Normalize all data (train + test) using training statistics
+        x_normalized = (x_filled - mean) / std
         x_normalized = torch.clamp(x_normalized, -100, 100)
         
-        # Get base embeddings
-        embeddings = self.linear(x_normalized)  # (batch, rows, features, embedding_size)
+        # Create nan indicator tensor (1 where nan, 0 where not)
+        nan_indicators = nan_mask.float()
         
-        # Apply missing value handling
-        # For missing values, replace with learned missing embedding
-        missing_mask_expanded = missing_mask.unsqueeze(-1).expand(-1, -1, -1, self.embedding_size)
-        embeddings = torch.where(
-            missing_mask_expanded,
-            self.missing_embedding.view(1, 1, 1, -1).expand(batch, rows, features, -1),
-            embeddings
-        )
+        # Step 5: Handle feature grouping and encode
+        g = self.features_per_group
         
-        # Add missing indicator to all positions that were missing
-        # This helps the model learn that missingness itself is informative
-        embeddings = embeddings + missing_mask_expanded.float() * self.missing_indicator_embedding.view(1, 1, 1, -1)
+        # Pad features to be divisible by group size
+        n_groups = (features + g - 1) // g
+        padded_features = n_groups * g
+        
+        if padded_features > features:
+            # Pad with zeros (and mark as nan)
+            pad_size = padded_features - features
+            x_pad = torch.zeros(batch, rows, pad_size, device=x_normalized.device, dtype=x_normalized.dtype)
+            x_normalized = torch.cat([x_normalized, x_pad], dim=2)
+            nan_pad = torch.ones(batch, rows, pad_size, device=nan_indicators.device, dtype=nan_indicators.dtype)
+            nan_indicators = torch.cat([nan_indicators, nan_pad], dim=2)
+        
+        # Reshape to groups: (batch, rows, n_groups, features_per_group)
+        x_grouped = x_normalized.reshape(batch, rows, n_groups, g)
+        nan_grouped = nan_indicators.reshape(batch, rows, n_groups, g)
+        
+        # Concatenate values and nan indicators: (batch, rows, n_groups, features_per_group * 2)
+        # This follows TabPFN's approach of [value, nan_indicator] input to the encoder
+        encoder_input = torch.cat([x_grouped, nan_grouped], dim=-1)
+        
+        # Step 6: Linear projection to embedding space
+        embeddings = self.encoder(encoder_input)  # (batch, rows, n_groups, embedding_size)
         
         return embeddings
 
@@ -171,6 +185,9 @@ class TransformerEncoderLayer(nn.Module):
     
     The attention pattern ensures test samples can attend to training samples
     but not to other test samples (to prevent data leakage).
+    
+    Uses PyTorch's scaled_dot_product_attention with Flash Attention (when available)
+    for significant speedups on supported hardware.
     """
     
     def __init__(
@@ -182,15 +199,20 @@ class TransformerEncoderLayer(nn.Module):
     ):
         super().__init__()
         
-        # Attention across features (columns)
-        self.attn_features = nn.MultiheadAttention(
-            embedding_size, n_heads, batch_first=True, dropout=dropout
-        )
+        self.embedding_size = embedding_size
+        self.n_heads = n_heads
+        self.head_dim = embedding_size // n_heads
+        self.dropout = dropout
         
-        # Attention across samples (rows)
-        self.attn_samples = nn.MultiheadAttention(
-            embedding_size, n_heads, batch_first=True, dropout=dropout
-        )
+        assert embedding_size % n_heads == 0, "embedding_size must be divisible by n_heads"
+        
+        # QKV projections for feature attention
+        self.qkv_features = nn.Linear(embedding_size, 3 * embedding_size, bias=True)
+        self.out_proj_features = nn.Linear(embedding_size, embedding_size, bias=True)
+        
+        # QKV projections for sample attention
+        self.qkv_samples = nn.Linear(embedding_size, 3 * embedding_size, bias=True)
+        self.out_proj_samples = nn.Linear(embedding_size, embedding_size, bias=True)
         
         # MLP block
         self.mlp = nn.Sequential(
@@ -203,6 +225,39 @@ class TransformerEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(embedding_size)
         self.norm2 = nn.LayerNorm(embedding_size)
         self.norm3 = nn.LayerNorm(embedding_size)
+    
+    def _attention(
+        self, 
+        q: torch.Tensor, 
+        k: torch.Tensor, 
+        v: torch.Tensor,
+        dropout_p: float = 0.0,
+    ) -> torch.Tensor:
+        """Apply scaled dot-product attention using Flash Attention when available.
+        
+        Args:
+            q, k, v: (batch, n_heads, seq_len, head_dim) tensors
+            dropout_p: dropout probability (only used during training)
+            
+        Returns:
+            (batch, n_heads, seq_len, head_dim) attention output
+        """
+        # PyTorch's SDPA automatically uses Flash Attention when:
+        # - CUDA device with compute capability >= 8.0 (Ampere+)
+        # - Inputs are float16 or bfloat16
+        # - No attention mask or causal mask is used
+        # Falls back to efficient C++ implementation otherwise
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None,
+            dropout_p=dropout_p if self.training else 0.0,
+            is_causal=False,
+        )
+    
+    def _reshape_for_attention(self, x: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Reshape (batch, seq, emb) -> (batch, n_heads, seq, head_dim)"""
+        seq_len = x.shape[1]
+        return x.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
     
     def forward(self, x: torch.Tensor, train_size: int) -> torch.Tensor:
         """
@@ -218,7 +273,23 @@ class TransformerEncoderLayer(nn.Module):
         # 1. Attention across features (for each row)
         # Reshape: (batch * rows, cols, emb)
         x_flat = x.reshape(batch_size * n_rows, n_cols, emb_size)
-        attn_out, _ = self.attn_features(x_flat, x_flat, x_flat)
+        
+        # Compute Q, K, V
+        qkv = self.qkv_features(x_flat)
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape for multi-head attention
+        q = self._reshape_for_attention(q, batch_size * n_rows)
+        k = self._reshape_for_attention(k, batch_size * n_rows)
+        v = self._reshape_for_attention(v, batch_size * n_rows)
+        
+        # Apply Flash Attention
+        attn_out = self._attention(q, k, v, self.dropout)
+        
+        # Reshape back: (batch*rows, n_heads, cols, head_dim) -> (batch*rows, cols, emb)
+        attn_out = attn_out.transpose(1, 2).reshape(batch_size * n_rows, n_cols, emb_size)
+        attn_out = self.out_proj_features(attn_out)
+        
         x_flat = x_flat + attn_out
         x = x_flat.reshape(batch_size, n_rows, n_cols, emb_size)
         x = self.norm1(x)
@@ -232,12 +303,32 @@ class TransformerEncoderLayer(nn.Module):
         x_train = x_flat[:, :train_size]
         x_test = x_flat[:, train_size:]
         
-        # Training samples attend to themselves
-        train_attn, _ = self.attn_samples(x_train, x_train, x_train)
+        # Compute Q, K, V for training samples (self-attention)
+        qkv_train = self.qkv_samples(x_train)
+        q_train, k_train, v_train = qkv_train.chunk(3, dim=-1)
+        
+        q_train = self._reshape_for_attention(q_train, batch_size * n_cols)
+        k_train = self._reshape_for_attention(k_train, batch_size * n_cols)
+        v_train = self._reshape_for_attention(v_train, batch_size * n_cols)
+        
+        # Training samples self-attention
+        train_attn = self._attention(q_train, k_train, v_train, self.dropout)
+        train_attn = train_attn.transpose(1, 2).reshape(batch_size * n_cols, train_size, emb_size)
+        train_attn = self.out_proj_samples(train_attn)
         
         # Test samples attend to training samples only
         if x_test.shape[1] > 0:
-            test_attn, _ = self.attn_samples(x_test, x_train, x_train)
+            test_size = x_test.shape[1]
+            
+            # Query from test, Key/Value from train
+            q_test = self.qkv_samples(x_test).chunk(3, dim=-1)[0]  # Only need Q
+            q_test = self._reshape_for_attention(q_test, batch_size * n_cols)
+            
+            # Reuse k_train and v_train from above
+            test_attn = self._attention(q_test, k_train, v_train, self.dropout)
+            test_attn = test_attn.transpose(1, 2).reshape(batch_size * n_cols, test_size, emb_size)
+            test_attn = self.out_proj_samples(test_attn)
+            
             attn_out = torch.cat([train_attn, test_attn], dim=1)
         else:
             attn_out = train_attn
@@ -299,6 +390,56 @@ class Decoder(nn.Module):
         return self.mlp(x)
 
 
+class FeaturePositionalEmbedding(nn.Module):
+    """Feature positional embeddings using the 'subspace' approach from TabPFN.
+    
+    This helps the model distinguish between different features during attention.
+    Each feature gets a unique positional identity by:
+    1. Generating a random vector in a lower-dimensional subspace
+    2. Projecting it to the full embedding dimension via a learned linear layer
+    
+    The random vectors are deterministically generated from a seed, ensuring
+    consistency across forward passes while allowing different features to
+    have different embeddings.
+    """
+    
+    def __init__(self, embedding_size: int, subspace_dim: int = None, max_features: int = 1000, seed: int = 0):
+        super().__init__()
+        self.embedding_size = embedding_size
+        self.subspace_dim = subspace_dim or embedding_size // 4
+        self.max_features = max_features
+        self.seed = seed
+        
+        # Learned projection from subspace to full embedding dimension
+        self.projection = nn.Linear(self.subspace_dim, embedding_size)
+        
+        # Pre-generate random subspace vectors for efficiency
+        # These are fixed random vectors, not learned
+        generator = torch.Generator().manual_seed(seed)
+        self.register_buffer(
+            'subspace_vectors',
+            torch.randn(max_features, self.subspace_dim, generator=generator)
+        )
+    
+    def forward(self, n_features: int) -> torch.Tensor:
+        """
+        Generate positional embeddings for n_features.
+        
+        Args:
+            n_features: Number of features (columns) to generate embeddings for
+            
+        Returns:
+            (n_features, embedding_size) tensor of positional embeddings
+        """
+        # Get the pre-generated random vectors for these features
+        subspace_vecs = self.subspace_vectors[:n_features]  # (n_features, subspace_dim)
+        
+        # Project to full embedding dimension
+        pos_emb = self.projection(subspace_vecs)  # (n_features, embedding_size)
+        
+        return pos_emb
+
+
 class OpenTabModel(nn.Module):
     """
     OpenTab: A implementation of TabPFN for tabular classification.
@@ -313,6 +454,11 @@ class OpenTabModel(nn.Module):
         n_layers: Number of transformer layers
         n_outputs: Number of output classes
         dropout: Dropout rate
+        use_feature_pos_emb: Whether to use feature positional embeddings
+        max_features: Maximum number of features (for positional embeddings)
+        features_per_group: Number of features to group together before attention.
+            Higher values reduce attention cost but may lose fine-grained feature info.
+            TabPFN uses 2. Set to 1 to disable grouping.
     """
     
     def __init__(
@@ -323,18 +469,35 @@ class OpenTabModel(nn.Module):
         n_layers: int = 3,
         n_outputs: int = 10,
         dropout: float = 0.0,
+        use_feature_pos_emb: bool = True,
+        max_features: int = 1000,
+        features_per_group: int = 1,
     ):
         super().__init__()
         
         self.embedding_size = embedding_size
         self.n_outputs = n_outputs
+        self.use_feature_pos_emb = use_feature_pos_emb
+        self.features_per_group = features_per_group
         
-        self.feature_encoder = FeatureEncoder(embedding_size)
+        self.feature_encoder = FeatureEncoder(embedding_size, features_per_group=features_per_group)
         self.target_encoder = TargetEncoder(embedding_size)
         self.transformer = TransformerEncoder(
             embedding_size, n_heads, mlp_hidden_size, n_layers, dropout
         )
         self.decoder = Decoder(embedding_size, mlp_hidden_size, n_outputs)
+        
+        # Feature positional embeddings (following TabPFN's "subspace" approach)
+        # Note: with grouping, we have fewer columns so we need fewer positional embeddings
+        if use_feature_pos_emb:
+            max_groups = (max_features + features_per_group - 1) // features_per_group
+            self.feature_pos_emb = FeaturePositionalEmbedding(
+                embedding_size, 
+                subspace_dim=embedding_size // 4,
+                max_features=max_groups + 1,  # +1 for target column
+            )
+        else:
+            self.feature_pos_emb = None
     
     def forward(
         self,
@@ -352,6 +515,7 @@ class OpenTabModel(nn.Module):
             (batch, n_test, n_outputs) tensor of logits for test samples
         """
         n_rows = x.shape[1]
+        n_features = x.shape[2]
         
         # Encode features: (batch, rows, features, emb)
         x_emb = self.feature_encoder(x, train_size)
@@ -359,8 +523,16 @@ class OpenTabModel(nn.Module):
         # Encode targets: (batch, rows, 1, emb)
         y_emb = self.target_encoder(y, n_rows)
         
-        # Concatenate features and target: (batch, rows, features+1, emb)
+        # Concatenate features (or feature groups) and target: (batch, rows, n_groups+1, emb)
         combined = torch.cat([x_emb, y_emb], dim=2)
+        
+        # Add feature positional embeddings
+        # This helps the model distinguish between different feature groups
+        if self.feature_pos_emb is not None:
+            n_cols = combined.shape[2]  # n_groups + 1 (for target)
+            pos_emb = self.feature_pos_emb(n_cols)  # (n_cols, emb)
+            # Broadcast across batch and rows: (1, 1, n_cols, emb)
+            combined = combined + pos_emb.unsqueeze(0).unsqueeze(0)
         
         # Apply transformer
         transformed = self.transformer(combined, train_size)

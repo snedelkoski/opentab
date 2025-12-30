@@ -90,6 +90,8 @@ class TrainConfig:
     max_features: int = 20
     max_samples: int = 100
     max_classes: int = 10
+    use_feature_pos_emb: bool = True  # Feature positional embeddings (TabPFN "subspace" style)
+    features_per_group: int = 2  # Group features before attention (TabPFN uses 2). Set to 1 to disable.
     
     # Training
     n_epochs: int = 100
@@ -244,6 +246,9 @@ class Trainer:
             mlp_hidden_size=config.mlp_hidden,
             n_outputs=config.max_classes,
             dropout=config.dropout,
+            use_feature_pos_emb=config.use_feature_pos_emb,
+            max_features=config.max_features,
+            features_per_group=config.features_per_group,
         ).to(self.device)
         
         # Create optimizer
