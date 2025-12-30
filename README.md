@@ -135,39 +135,6 @@ This generates:
 - **Improvability scores**
 - **Comparison figures** saved to `eval_results/leaderboard/`
 
-### TabArena Wrappers
-
-Two wrapper classes implement the `AbstractExecModel` interface for TabArena compatibility:
-
-```python
-from evaluate import OpenTabWrapper, OpenTabRegressionWrapper
-
-# Classification (binary/multiclass)
-clf = OpenTabWrapper(problem_type='multiclass', eval_metric=metric)
-clf._fit(X_train, y_train)
-predictions = clf._predict(X_test)
-probabilities = clf._predict_proba(X_test)
-clf.cleanup()  # Release GPU memory
-
-# Regression
-reg = OpenTabRegressionWrapper(problem_type='regression', eval_metric=metric)
-reg._fit(X_train, y_train)
-predictions = reg._predict(X_test)
-reg.cleanup()
-```
-
-### Wrapper Features
-
-| Feature | OpenTabWrapper | OpenTabRegressionWrapper |
-|---------|----------------|--------------------------|
-| Problem types | `binary`, `multiclass` | `regression` |
-| `_fit()` with resources | ✅ `num_cpus`, `num_gpus`, `time_limit` | ✅ |
-| `_predict()` | ✅ Returns `pd.Series` | ✅ Returns `pd.Series` |
-| `_predict_proba()` | ✅ Returns `pd.DataFrame` | ❌ (raises `NotImplementedError`) |
-| `cleanup()` | ✅ Releases GPU memory | ✅ |
-| Batched inference | ✅ (64 samples/batch) | ✅ |
-| Auto subsampling | ✅ (512 train samples max) | ✅ |
-
 ## Key Commands
 
 | Task | Command |
