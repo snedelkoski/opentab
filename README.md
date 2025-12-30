@@ -5,8 +5,14 @@ An open implementation of TabPFN-like models (Prior-Data Fitted Network for Tabu
 ## Quick Start
 
 ```bash
-# Install
-pip install -e .
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment and install dependencies
+uv sync
+
+# Install TabArena for benchmarking (optional)
+uv pip install "tabarena @ git+https://github.com/autogluon/tabarena.git#subdirectory=tabarena"
 
 # Generate synthetic data for classification
 python generate_data.py --prior mixed --n_datasets 100000 --output data/synthetic_clf.h5
@@ -26,8 +32,11 @@ python evaluate.py --checkpoint checkpoints/classifier.pt --mode quick
 # Evaluate regression
 python evaluate.py --checkpoint checkpoints/regressor.pt --mode quick-regression
 
-# Evaluate on TabArena benchmark (classification, requires: pip install tabarena autogluon openml)
-source .venv/bin/activate && python evaluate.py --checkpoint checkpoints/classifier.pt --mode lite
+# Evaluate on TabArena benchmark (51 datasets)
+python evaluate.py --checkpoint checkpoints/classifier.pt --mode lite
+
+# Generate leaderboard comparing against SOTA methods
+python evaluate.py --mode leaderboard --results eval_results --method OpenTab
 ```
 
 ## Two-Model Approach
@@ -88,13 +97,14 @@ OpenTab includes full [TabArena](https://github.com/autogluon/tabarena) compatib
 ### Installation
 
 ```bash
-# Basic TabArena installation
-pip install tabarena autogluon openml
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Or full TabArena installation (recommended)
-git clone https://github.com/autogluon/tabarena.git
-cd tabarena
-uv pip install --prerelease=allow -e ./tabarena[benchmark]
+# Install dependencies
+uv sync
+
+# Install TabArena
+uv pip install "tabarena @ git+https://github.com/autogluon/tabarena.git#subdirectory=tabarena"
 ```
 
 ### Evaluation Modes
@@ -112,7 +122,6 @@ uv pip install --prerelease=allow -e ./tabarena[benchmark]
 
 ```bash
 # Step 1: Run TabArena-Lite evaluation (51 datasets, 1 fold each)
-source .venv/bin/activate
 python evaluate.py --checkpoint checkpoints/classifier.pt --mode lite
 
 # Step 2: Generate leaderboard comparing against all TabArena baselines
