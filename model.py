@@ -468,27 +468,50 @@ class OpenTabClassifier:
         self.n_classes_ = int(y.max()) + 1
         return self
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Predict class probabilities for test samples."""
+    def predict_proba(self, X: np.ndarray, batch_size: int = 512) -> np.ndarray:
+        """Predict class probabilities for test samples.
+        
+        Args:
+            X: Test samples array
+            batch_size: Number of test samples to process at once (to avoid OOM)
+        """
         if self.X_train_ is None:
             raise ValueError("Must call fit() before predict()")
         
         X_test = X.astype(np.float32)
+        n_test = X_test.shape[0]
         
-        with torch.no_grad():
-            # Add batch dimension
-            X_train_t = torch.from_numpy(self.X_train_).unsqueeze(0).to(self.device)
-            y_train_t = torch.from_numpy(self.y_train_).float().unsqueeze(0).to(self.device)
-            X_test_t = torch.from_numpy(X_test).unsqueeze(0).to(self.device)
+        # Process in batches to avoid memory issues
+        if n_test <= batch_size:
+            # Small enough to process at once
+            with torch.no_grad():
+                X_train_t = torch.from_numpy(self.X_train_).unsqueeze(0).to(self.device)
+                y_train_t = torch.from_numpy(self.y_train_).float().unsqueeze(0).to(self.device)
+                X_test_t = torch.from_numpy(X_test).unsqueeze(0).to(self.device)
+                
+                logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
+                logits = logits[:, :, :self.n_classes_]
+                probs = F.softmax(logits, dim=-1)
+                
+                return probs.squeeze(0).cpu().numpy()
+        else:
+            # Process in batches
+            all_probs = []
+            with torch.no_grad():
+                X_train_t = torch.from_numpy(self.X_train_).unsqueeze(0).to(self.device)
+                y_train_t = torch.from_numpy(self.y_train_).float().unsqueeze(0).to(self.device)
+                
+                for i in range(0, n_test, batch_size):
+                    batch_end = min(i + batch_size, n_test)
+                    X_batch = X_test[i:batch_end]
+                    X_test_t = torch.from_numpy(X_batch).unsqueeze(0).to(self.device)
+                    
+                    logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
+                    logits = logits[:, :, :self.n_classes_]
+                    probs = F.softmax(logits, dim=-1)
+                    all_probs.append(probs.squeeze(0).cpu().numpy())
             
-            # Forward pass
-            logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
-            
-            # Get probabilities for actual classes
-            logits = logits[:, :, :self.n_classes_]
-            probs = F.softmax(logits, dim=-1)
-            
-            return probs.squeeze(0).cpu().numpy()
+            return np.concatenate(all_probs, axis=0)
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels for test samples."""

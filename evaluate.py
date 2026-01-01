@@ -119,8 +119,6 @@ class OpenTabWrapper(AbstractExecModel):
                 mlp_hidden_size=config.get('mlp_hidden', 192),
                 n_outputs=config.get('max_classes', 10),
                 dropout=config.get('dropout', 0.0),
-                max_features=self._max_features,
-                features_per_group=config.get('features_per_group', 1),
             )
             model.load_state_dict(checkpoint['model_state'])
             self._model = OpenTabClassifier(model=model, device=device)
