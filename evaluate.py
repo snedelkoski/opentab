@@ -113,18 +113,19 @@ class OpenTabWrapper(AbstractExecModel):
             self._max_features = config.get('max_features', 100)
             
             model = OpenTabModel(
-                embedding_size=config.get('embedding_size', 96),
+                embedding_size=config.get('embedding_size', 128),
                 n_heads=config.get('n_heads', 4),
-                n_layers=config.get('n_layers', 3),
-                mlp_hidden_size=config.get('mlp_hidden', 192),
+                n_layers=config.get('n_layers', 6),
+                mlp_hidden_size=config.get('mlp_hidden_size', 256),
                 n_outputs=config.get('max_classes', 10),
+                max_features=self._max_features,
                 dropout=config.get('dropout', 0.0),
             )
             model.load_state_dict(checkpoint['model_state'])
             self._model = OpenTabClassifier(model=model, device=device)
         else:
             self._max_features = self.MAX_FEATURES
-            model = OpenTabModel(n_outputs=max(10, self._n_classes))
+            model = OpenTabModel(n_outputs=max(10, self._n_classes), max_features=self._max_features)
             self._model = OpenTabClassifier(model=model, device=device)
         
         # Limit features to what model was trained on
