@@ -17,15 +17,14 @@ Reference:
 - "TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second"
 """
 
-import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Union
+from typing import Optional, Union
 
 
-class TabPFNEncoder(nn.Module):
+class OpenTabEncoder(nn.Module):
     """
     Encodes tabular data into embeddings.
     
@@ -82,7 +81,6 @@ class TabPFNEncoder(nn.Module):
         """
         batch_size, n_samples, n_features = X.shape
         device = X.device
-        
         # Handle missing values
         if missing_mask is None:
             # Detect NaN or special missing value (-999)
@@ -94,15 +92,13 @@ class TabPFNEncoder(nn.Module):
         
         # Z-normalize using training set statistics (per feature)
         X_train = X_filled[:, :train_size, :]  # (batch, train_size, n_features)
-        
         # Compute mean and std from training portion
         mean = X_train.mean(dim=1, keepdim=True)  # (batch, 1, n_features)
         std = X_train.std(dim=1, keepdim=True) + 1e-8  # (batch, 1, n_features)
-        
         # Normalize all samples using training statistics
         X_normalized = (X_filled - mean) / std
         X_normalized = torch.clamp(X_normalized, -100, 100)
-        
+
         # Create input: [normalized_value, missing_indicator]
         missing_indicator = missing_mask.float()
         encoder_input = torch.stack([X_normalized, missing_indicator], dim=-1)
@@ -146,7 +142,6 @@ class TabPFNEncoder(nn.Module):
         # Concatenate features and target
         embeddings = torch.cat([feature_embeddings, target_embeddings], dim=2)
         # Shape: (batch, n_samples, n_features + 1, embedding_dim)
-        
         return embeddings
 
 
@@ -239,13 +234,13 @@ class InterSampleAttention(nn.Module):
         
         # Reshape and transpose back
         x = x_flat.reshape(batch_size, n_features, n_samples, embedding_dim)
-        x = x.transpose(1, 2)  # (batch, n_samples, n_features, embedding_dim)
+        x = x.transpose(2, 1)  # (batch, n_samples, n_features, embedding_dim)
         x = self.norm(x)
         
         return x
 
 
-class TabPFNLayer(nn.Module):
+class OpenTabLayer(nn.Module):
     """
     Single transformer layer with two-way attention + MLP.
     
@@ -298,7 +293,7 @@ class TabPFNLayer(nn.Module):
         return x
 
 
-class TabPFNDecoder(nn.Module):
+class OpenTabDecoder(nn.Module):
     """
     Decoder that maps embeddings to predictions.
     
@@ -359,19 +354,19 @@ class OpenTabModel(nn.Module):
         self.max_features = max_features
         
         # Encoder
-        self.encoder = TabPFNEncoder(
+        self.encoder = OpenTabEncoder(
             embedding_dim=embedding_size,
             max_features=max_features,
         )
         
         # Transformer layers
         self.layers = nn.ModuleList([
-            TabPFNLayer(embedding_size, n_heads, mlp_hidden_size, dropout)
+            OpenTabLayer(embedding_size, n_heads, mlp_hidden_size, dropout)
             for _ in range(n_layers)
         ])
         
         # Decoder
-        self.decoder = TabPFNDecoder(embedding_size, mlp_hidden_size, n_outputs)
+        self.decoder = OpenTabDecoder(embedding_size, mlp_hidden_size, n_outputs)
     
     def forward(
         self,
@@ -395,7 +390,7 @@ class OpenTabModel(nn.Module):
         # Encode inputs
         embeddings = self.encoder(X, y_train, train_size, missing_mask)
         # Shape: (batch, n_samples, n_features + 1, embedding_dim)
-        
+
         # Apply transformer layers
         for layer in self.layers:
             embeddings = layer(embeddings, train_size)
@@ -646,19 +641,21 @@ if __name__ == "__main__":
     model = OpenTabModel(
         embedding_size=128,
         n_heads=4,
-        mlp_hidden_size=256,
-        n_layers=6,
-        n_outputs=10,
+        mlp_hidden_size=192,
+        n_layers=3,
+        n_outputs=8,
     )
     
-    print(f"Parameters: {count_parameters(model):,}")
+    print(f"Trainable parameters: {count_parameters(model):,}")
     
     # Test forward pass
     batch_size = 2
-    n_train, n_test, n_features = 50, 10, 8
+    n_train, n_test, n_features, n_classes = 150, 50, 20, 8
     
     X = torch.randn(batch_size, n_train + n_test, n_features)
-    y_train = torch.randint(0, 3, (batch_size, n_train))
+    X[0, 0, 0] = float('nan')  # Test missing value
+    X[0, 0, 1] = -999.0 # Test missing value
+    y_train = torch.randint(0, n_classes, (batch_size, n_train))
     
     logits = model(X, y_train, n_train)
     
