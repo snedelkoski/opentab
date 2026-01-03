@@ -94,7 +94,11 @@ class OpenTabEncoder(nn.Module):
         X_train = X_filled[:, :train_size, :]  # (batch, train_size, n_features)
         # Compute mean and std from training portion
         mean = X_train.mean(dim=1, keepdim=True)  # (batch, 1, n_features)
-        std = X_train.std(dim=1, keepdim=True) + 1e-8  # (batch, 1, n_features)
+        # Handle edge case: if train_size <= 1, std is undefined, use 1.0 (no scaling)
+        if train_size > 1:
+            std = X_train.std(dim=1, keepdim=True) + 1e-8  # (batch, 1, n_features)
+        else:
+            std = torch.ones_like(mean)
         # Normalize all samples using training statistics
         X_normalized = (X_filled - mean) / std
         X_normalized = torch.clamp(X_normalized, -100, 100)

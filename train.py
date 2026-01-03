@@ -100,6 +100,7 @@ class TrainConfig:
     seed: int = 42
     device: str = 'auto'
     use_amp: bool = True  # Automatic mixed precision
+    compile_model: bool = False  # Use torch.compile() for speedup
     
     def __post_init__(self):
         if self.device == 'auto':
@@ -273,6 +274,11 @@ class Trainer:
             dropout=config.dropout,
         ).to(self.device)
         
+        # Optionally compile model for faster training (PyTorch 2.0+)
+        if config.compile_model:
+            print("Compiling model with torch.compile()...")
+            self.model = torch.compile(self.model, mode='default')
+        
         # Optimizer: Adam with weight decay
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -350,10 +356,15 @@ class Trainer:
             test_logits = logits[0, :ns - ts]
             test_targets = y[i, ts:ns]
             
+            print(test_logits.shape, test_targets.shape)  # --- IGNORE ---
+
             if self.config.is_regression:
                 # For regression, use cross-entropy over bins
                 loss = F.cross_entropy(test_logits, test_targets.long())
             else:
+                # Following original TabPFN/OpenTab: compute CE over all logits
+                # Labels are normalized to 0, 1, ..., n_classes-1 in generate_data.py
+                # so CE will work correctly without truncation
                 loss = F.cross_entropy(test_logits, test_targets)
             
             if not torch.isnan(loss):
@@ -488,8 +499,8 @@ class Trainer:
         # Create smaller config for evaluation to avoid OOM
         eval_config = TrainConfig(
             max_train_samples=256,  # Smaller for eval
-            eval_samples=64,
-            max_features=32,
+            eval_samples=128,
+            max_features=self.config.max_features,
             max_classes=self.config.max_classes,
             is_regression=self.config.is_regression,
             batch_size=1,  # Process one at a time
@@ -537,8 +548,7 @@ class Trainer:
                     test_targets = y[j, ts:ns]
                     
                     if not self.config.is_regression:
-                        n_classes = int(test_targets.max().item()) + 1
-                        test_logits = test_logits[:, :n_classes]
+                        # Labels are normalized, so just compute CE directly
                         loss = F.cross_entropy(test_logits, test_targets)
                         preds = test_logits.argmax(dim=-1)
                         total_correct += (preds == test_targets).sum().item()
@@ -688,6 +698,8 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--compile', action='store_true',
+                       help='Use torch.compile() for ~10-20%% faster training (PyTorch 2.0+)')
     
     args = parser.parse_args()
     
@@ -718,6 +730,7 @@ def main():
         output_dir=args.output_dir,
         seed=args.seed,
         device=args.device,
+        compile_model=args.compile,
     )
     
     trainer = Trainer(config)

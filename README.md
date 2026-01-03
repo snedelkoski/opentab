@@ -111,6 +111,7 @@ python train.py --online --resume checkpoints/model_50000.pt
 | `--max_classes` | 10 | Maximum number of classes (classification) |
 | `--n_bins` | 64 | Number of bins (regression) |
 | `--output_dir` | checkpoints | Output directory for checkpoints |
+| `--compile` | False | Use torch.compile() for ~10-20% faster training |
 
 ## Data Generation
 

@@ -777,6 +777,20 @@ class SCMDataGenerator:
             y = target_values.astype(np.float32)
         else:
             y = target_values.astype(np.int64)
+            
+            # CRITICAL: Normalize labels to be consecutive 0, 1, ..., n_classes-1
+            # This is essential for cross-entropy loss to work correctly.
+            # TabPFN v1 does this in flexible_categorical.py with normalize_labels=True
+            unique_labels = np.unique(y)
+            if len(unique_labels) > 1:
+                # Create mapping from original labels to 0, 1, 2, ...
+                label_mapping = {old: new for new, old in enumerate(unique_labels)}
+                y = np.array([label_mapping[label] for label in y], dtype=np.int64)
+                hp.n_classes = len(unique_labels)
+            else:
+                # Only one class - this is a degenerate case, but handle gracefully
+                y = np.zeros_like(y, dtype=np.int64)
+                hp.n_classes = 1
         
         # Step 6: Apply post-processing to features (NOT to regression target)
         X, categorical_mask, missing_mask = apply_post_processing(X, hp)
@@ -1046,8 +1060,8 @@ def main():
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     
     generator = SyntheticDatasetGenerator(
-        n_samples_range=(1, args.max_samples),
-        n_features_range=(1, args.max_features),
+        n_samples_range=(32, args.max_samples),
+        n_features_range=(2, args.max_features),
         n_classes_range=(2, args.max_classes),
         is_regression=args.regression,
     )
