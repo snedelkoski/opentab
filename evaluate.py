@@ -77,8 +77,8 @@ class OpenTabWrapper(AbstractExecModel):
     """
     
     # TabPFN-style limits
-    MAX_TRAIN_SAMPLES = 1024
-    MAX_FEATURES = 100
+    MAX_TRAIN_SAMPLES = 512
+    MAX_FEATURES = 50
     
     def __init__(self, checkpoint_path: Optional[str] = None, **kwargs):
         super().__init__(**kwargs)
