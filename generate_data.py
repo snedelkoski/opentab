@@ -17,8 +17,11 @@ Reference:
 
 import argparse
 import random
-from typing import Tuple, Optional, Dict, Callable
+import os
+from typing import Tuple, Optional, Dict, Callable, List
 from dataclasses import dataclass, field
+from functools import partial
+import multiprocessing as mp
 
 import numpy as np
 import h5py
@@ -818,9 +821,120 @@ class SCMDataGenerator:
 # Dataset Batch Generator and Storage
 # ============================================================================
 
+def _generate_single_dataset_worker(args: Tuple) -> Dict:
+    """
+    Worker function for parallel dataset generation.
+    Must be a top-level function for multiprocessing to work.
+    
+    Args:
+        args: Tuple of (worker_id, seed, generator_params, max_samples, max_features)
+    
+    Returns:
+        Dictionary with dataset arrays
+    """
+    worker_id, seed, generator_params, max_samples, max_features = args
+    
+    # Set unique seed for this worker
+    worker_seed = seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    
+    # Create generator with params
+    generator = SCMDataGenerator(
+        n_samples_range=generator_params['n_samples_range'],
+        n_features_range=generator_params['n_features_range'],
+        n_classes_range=generator_params['n_classes_range'],
+        is_regression=generator_params['is_regression'],
+    )
+    
+    # Generate dataset
+    train_ratio = random.uniform(*generator_params['train_ratio_range'])
+    dataset = generator.generate(train_ratio=train_ratio)
+    
+    n_samples = min(dataset.X.shape[0], max_samples)
+    n_features = min(dataset.X.shape[1], max_features)
+    
+    # Prepare result arrays (padded to max sizes)
+    X = np.zeros((max_samples, max_features), dtype=np.float32)
+    y = np.zeros(max_samples, dtype=np.float32)
+    categorical_mask = np.zeros(max_features, dtype=bool)
+    missing_mask = np.zeros((max_samples, max_features), dtype=bool)
+    
+    X[:n_samples, :n_features] = dataset.X[:n_samples, :n_features]
+    y[:n_samples] = dataset.y[:n_samples]
+    
+    if dataset.categorical_mask is not None:
+        categorical_mask[:n_features] = dataset.categorical_mask[:n_features]
+    if dataset.missing_mask is not None:
+        missing_mask[:n_samples, :n_features] = dataset.missing_mask[:n_samples, :n_features]
+    
+    return {
+        'X': X,
+        'y': y,
+        'train_size': min(dataset.train_size, n_samples - 1),
+        'n_features': n_features,
+        'n_samples': n_samples,
+        'categorical_mask': categorical_mask,
+        'missing_mask': missing_mask,
+    }
+
+
+def _generate_batch_parallel(
+    batch_size: int,
+    generator_params: Dict,
+    max_samples: int,
+    max_features: int,
+    n_workers: int,
+    base_seed: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Generate a batch of datasets in parallel using multiprocessing.
+    
+    Args:
+        batch_size: Number of datasets to generate
+        generator_params: Parameters for the SCMDataGenerator
+        max_samples: Maximum samples per dataset
+        max_features: Maximum features per dataset
+        n_workers: Number of parallel workers
+        base_seed: Base random seed (each worker gets base_seed + worker_id)
+    
+    Returns:
+        Dictionary with batched arrays
+    """
+    # Prepare arguments for each worker
+    args_list = [
+        (i, base_seed, generator_params, max_samples, max_features)
+        for i in range(batch_size)
+    ]
+    
+    # Use multiprocessing pool
+    with mp.Pool(processes=n_workers) as pool:
+        results = pool.map(_generate_single_dataset_worker, args_list)
+    
+    # Aggregate results
+    X_batch = np.stack([r['X'] for r in results], axis=0)
+    y_batch = np.stack([r['y'] for r in results], axis=0)
+    train_sizes = np.array([r['train_size'] for r in results], dtype=np.int32)
+    n_features_list = np.array([r['n_features'] for r in results], dtype=np.int32)
+    n_samples_list = np.array([r['n_samples'] for r in results], dtype=np.int32)
+    categorical_masks = np.stack([r['categorical_mask'] for r in results], axis=0)
+    missing_masks = np.stack([r['missing_mask'] for r in results], axis=0)
+    
+    return {
+        'X': X_batch,
+        'y': y_batch,
+        'train_size': train_sizes,
+        'n_features': n_features_list,
+        'n_samples': n_samples_list,
+        'categorical_mask': categorical_masks,
+        'missing_mask': missing_masks,
+    }
+
+
 class SyntheticDatasetGenerator:
     """
     Generate and save batches of synthetic datasets for training.
+    Supports parallel generation using multiple CPU cores.
     """
     
     def __init__(
@@ -830,15 +944,36 @@ class SyntheticDatasetGenerator:
         n_classes_range: Tuple[int, int] = (2, 10),
         train_ratio_range: Tuple[float, float] = (0.5, 0.9),
         is_regression: bool = False,
+        n_workers: int = None,
     ):
+        self.n_samples_range = n_samples_range
+        self.n_features_range = n_features_range
+        self.n_classes_range = n_classes_range
+        self.train_ratio_range = train_ratio_range
+        self.is_regression = is_regression
+        
+        # Set number of workers (default to number of CPU cores)
+        if n_workers is None:
+            self.n_workers = mp.cpu_count()
+        else:
+            self.n_workers = max(1, n_workers)
+        
+        # Keep a local generator for non-parallel use
         self.generator = SCMDataGenerator(
             n_samples_range=n_samples_range,
             n_features_range=n_features_range,
             n_classes_range=n_classes_range,
             is_regression=is_regression,
         )
-        self.train_ratio_range = train_ratio_range
-        self.is_regression = is_regression
+        
+        # Parameters dict for passing to workers
+        self._generator_params = {
+            'n_samples_range': n_samples_range,
+            'n_features_range': n_features_range,
+            'n_classes_range': n_classes_range,
+            'train_ratio_range': train_ratio_range,
+            'is_regression': is_regression,
+        }
     
     def generate_batch(
         self,
@@ -846,9 +981,19 @@ class SyntheticDatasetGenerator:
         max_samples: int,
         max_features: int,
         max_classes: int,
+        parallel: bool = True,
+        base_seed: int = None,
     ) -> Dict[str, np.ndarray]:
         """
         Generate a batch of synthetic datasets.
+        
+        Args:
+            batch_size: Number of datasets to generate
+            max_samples: Maximum samples per dataset
+            max_features: Maximum features per dataset
+            max_classes: Maximum number of classes
+            parallel: Whether to use parallel generation (default: True)
+            base_seed: Base random seed for reproducibility
         
         Returns:
             Dictionary with:
@@ -860,6 +1005,21 @@ class SyntheticDatasetGenerator:
             - categorical_mask: (batch, max_features) categorical feature indicators
             - missing_mask: (batch, max_samples, max_features) missing value indicators
         """
+        if base_seed is None:
+            base_seed = random.randint(0, 2**31 - 1)
+        
+        # Use parallel generation if enabled and batch is large enough
+        if parallel and self.n_workers > 1 and batch_size >= self.n_workers:
+            return _generate_batch_parallel(
+                batch_size=batch_size,
+                generator_params=self._generator_params,
+                max_samples=max_samples,
+                max_features=max_features,
+                n_workers=self.n_workers,
+                base_seed=base_seed,
+            )
+        
+        # Fall back to sequential generation
         X_batch = np.zeros((batch_size, max_samples, max_features), dtype=np.float32)
         y_batch = np.zeros((batch_size, max_samples), dtype=np.float32)
         train_sizes = np.zeros(batch_size, dtype=np.int32)
@@ -907,9 +1067,24 @@ class SyntheticDatasetGenerator:
         max_samples: int = 100,
         max_features: int = 20,
         max_classes: int = 10,
+        parallel: bool = True,
     ):
-        """Generate datasets and save to HDF5 file."""
+        """
+        Generate datasets and save to HDF5 file.
+        
+        Args:
+            output_path: Path to output HDF5 file
+            n_datasets: Total number of datasets to generate
+            batch_size: Number of datasets per batch
+            max_samples: Maximum samples per dataset
+            max_features: Maximum features per dataset
+            max_classes: Maximum number of classes
+            parallel: Whether to use parallel generation (default: True)
+        """
         n_batches = (n_datasets + batch_size - 1) // batch_size
+        
+        if parallel and self.n_workers > 1:
+            print(f"Using {self.n_workers} parallel workers for data generation")
         
         with h5py.File(output_path, 'w') as f:
             # Create datasets with chunked storage
@@ -940,15 +1115,20 @@ class SyntheticDatasetGenerator:
             
             # Generate batches
             total_generated = 0
+            base_seed = random.randint(0, 2**31 - 1)
             pbar = tqdm(range(n_batches), desc="Generating datasets")
             
-            for _ in pbar:
+            for batch_idx in pbar:
                 current_batch_size = min(batch_size, n_datasets - total_generated)
                 if current_batch_size <= 0:
                     break
                 
+                # Use different seed for each batch to ensure reproducibility
+                batch_seed = base_seed + batch_idx * batch_size
+                
                 batch = self.generate_batch(
-                    current_batch_size, max_samples, max_features, max_classes
+                    current_batch_size, max_samples, max_features, max_classes,
+                    parallel=parallel, base_seed=batch_seed
                 )
                 
                 # Append to HDF5
@@ -1042,6 +1222,10 @@ def main():
                        help='Generate regression datasets instead of classification')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--workers', '-w', type=int, default=None,
+                       help='Number of parallel workers (default: all CPU cores)')
+    parser.add_argument('--no-parallel', action='store_true',
+                       help='Disable parallel generation')
     parser.add_argument('--visualize', action='store_true',
                        help='Visualize sample datasets instead of generating data')
     
@@ -1056,7 +1240,6 @@ def main():
         return
     
     # Generate data
-    import os
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     
     generator = SyntheticDatasetGenerator(
@@ -1064,6 +1247,7 @@ def main():
         n_features_range=(2, args.max_features),
         n_classes_range=(2, args.max_classes),
         is_regression=args.regression,
+        n_workers=args.workers,
     )
     
     generator.generate_and_save(
@@ -1073,6 +1257,7 @@ def main():
         max_samples=args.max_samples,
         max_features=args.max_features,
         max_classes=args.max_classes,
+        parallel=not args.no_parallel,
     )
 
 
