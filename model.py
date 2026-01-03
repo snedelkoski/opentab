@@ -487,25 +487,40 @@ class OpenTabClassifier:
         self.n_classes_ = int(y.max()) + 1
         return self
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Predict class probabilities."""
+    def predict_proba(self, X: np.ndarray, batch_size: int = 512) -> np.ndarray:
+        """
+        Predict class probabilities.
+        
+        Args:
+            X: Test features (n_samples, n_features)
+            batch_size: Max test samples per batch to avoid OOM
+        """
         if self.X_train_ is None:
             raise ValueError("Must call fit() first")
         
         X_test = X.astype(np.float32)
+        n_test = X_test.shape[0]
+        
+        # Process in batches to avoid OOM on large test sets
+        all_probs = []
         
         with torch.no_grad():
             X_train_t = torch.from_numpy(self.X_train_).unsqueeze(0).to(self.device)
             y_train_t = torch.from_numpy(self.y_train_).unsqueeze(0).to(self.device)
-            X_test_t = torch.from_numpy(X_test).unsqueeze(0).to(self.device)
             
-            logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
-            logits = logits[:, :, :self.n_classes_]
+            for start_idx in range(0, n_test, batch_size):
+                end_idx = min(start_idx + batch_size, n_test)
+                X_batch = X_test[start_idx:end_idx]
+                X_test_t = torch.from_numpy(X_batch).unsqueeze(0).to(self.device)
+                
+                logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
+                logits = logits[:, :, :self.n_classes_]
+                
+                # Apply temperature scaling
+                probs = F.softmax(logits / self.temperature, dim=-1)
+                all_probs.append(probs.squeeze(0).cpu().numpy())
             
-            # Apply temperature scaling
-            probs = F.softmax(logits / self.temperature, dim=-1)
-            
-            return probs.squeeze(0).cpu().numpy()
+            return np.concatenate(all_probs, axis=0)
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels."""
@@ -580,25 +595,41 @@ class OpenTabRegressor:
         
         return self
     
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict regression values (expected value over bins)."""
+    def predict(self, X: np.ndarray, batch_size: int = 512) -> np.ndarray:
+        """
+        Predict regression values (expected value over bins).
+        
+        Args:
+            X: Test features (n_samples, n_features)
+            batch_size: Max test samples per batch to avoid OOM
+        """
         if self.X_train_ is None:
             raise ValueError("Must call fit() first")
         
         X_test = X.astype(np.float32)
+        n_test = X_test.shape[0]
+        
+        # Process in batches to avoid OOM on large test sets
+        all_predictions = []
         
         with torch.no_grad():
             X_train_t = torch.from_numpy(self.X_train_).unsqueeze(0).to(self.device)
             y_train_t = torch.from_numpy(self.y_train_).unsqueeze(0).to(self.device)
-            X_test_t = torch.from_numpy(X_test).unsqueeze(0).to(self.device)
             
-            logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
-            probs = F.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+            for start_idx in range(0, n_test, batch_size):
+                end_idx = min(start_idx + batch_size, n_test)
+                X_batch = X_test[start_idx:end_idx]
+                X_test_t = torch.from_numpy(X_batch).unsqueeze(0).to(self.device)
+                
+                logits = self.model.forward_train_test(X_train_t, y_train_t, X_test_t)
+                probs = F.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+                
+                # Expected value
+                predictions = (probs * self.bin_centers_).sum(axis=-1)
+                all_predictions.append(predictions)
             
-            # Expected value
-            predictions = (probs * self.bin_centers_).sum(axis=-1)
-            
-            # Denormalize
+            # Concatenate and denormalize
+            predictions = np.concatenate(all_predictions, axis=0)
             predictions = predictions * self.y_std_ + self.y_mean_
             
             return predictions

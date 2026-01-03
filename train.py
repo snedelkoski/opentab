@@ -26,6 +26,7 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Dict, Iterator
 
@@ -79,6 +80,7 @@ class TrainConfig:
     # Training
     n_steps: int = 100000  # Paper uses ~2M steps
     batch_size: int = 64  # Paper uses 64
+    gradient_accumulation_steps: int = 1  # Accumulate gradients over N micro-batches
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 1000
@@ -282,7 +284,9 @@ class Trainer:
         self.scheduler = self._create_scheduler()
         
         # Mixed precision
-        self.scaler = torch.amp.GradScaler('cuda') if config.use_amp and self.device.type == 'cuda' else None
+        device_type = self.device.type
+        self.autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+        self.scaler = None  # Not needed with bfloat16
         
         # Training state
         self.global_step = 0
@@ -359,29 +363,33 @@ class Trainer:
             return torch.stack(losses).mean()
         return torch.tensor(0.0, device=self.device, requires_grad=True)
     
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single training step."""
-        self.model.train()
-        self.optimizer.zero_grad()
+    def train_step(self, batch: Dict[str, torch.Tensor], is_accumulating: bool = False) -> float:
+        """
+        Single training step with gradient accumulation support.
         
-        # Mixed precision forward pass
-        if self.scaler is not None:
-            with torch.amp.autocast('cuda'):
-                loss = self.compute_loss(batch)
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
+        Args:
+            batch: Input batch
+            is_accumulating: If True, don't step optimizer (accumulating gradients)
+        """
+        self.model.train()
+        
+        # Mixed precision forward pass with bfloat16 autocast
+        with self.autocast_ctx:
             loss = self.compute_loss(batch)
-            loss.backward()
+            # Scale loss for gradient accumulation
+            loss = loss / self.config.gradient_accumulation_steps
+        
+        loss.backward()
+        
+        if not is_accumulating:
+            # Clip gradients and step optimizer only after accumulation is complete
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
         
-        self.scheduler.step()
-        
-        return loss.item()
+        # Return unscaled loss for logging
+        return loss.item() * self.config.gradient_accumulation_steps
     
     def train(self, data_path: Optional[str] = None):
         """Main training loop."""
@@ -410,24 +418,38 @@ class Trainer:
         
         print(f"Training for {self.config.n_steps} steps")
         print(f"Batch size: {self.config.batch_size}")
+        print(f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
+        print(f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         print(f"Device: {self.device}")
         print()
         
         # Training loop
         losses = []
         start_time = time.time()
+        self.optimizer.zero_grad()  # Initialize gradients
+        
+        micro_step = 0  # Track micro-steps for gradient accumulation
         
         for step in range(self.config.n_steps):
-            # Get batch
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(loader)
-                batch = next(data_iter)
+            accumulated_loss = 0.0
             
-            # Train step
-            loss = self.train_step(batch)
-            losses.append(loss)
+            # Gradient accumulation loop
+            for accum_step in range(self.config.gradient_accumulation_steps):
+                # Get batch
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(loader)
+                    batch = next(data_iter)
+                
+                # Check if still accumulating (not last micro-step)
+                is_accumulating = (accum_step < self.config.gradient_accumulation_steps - 1)
+                
+                # Train step
+                loss = self.train_step(batch, is_accumulating=is_accumulating)
+                accumulated_loss += loss / self.config.gradient_accumulation_steps
+            
+            losses.append(accumulated_loss)
             self.global_step = step + 1
             
             # Logging
@@ -463,11 +485,19 @@ class Trainer:
         """Evaluate on fresh synthetic data and sklearn datasets."""
         self.model.eval()
         
-        # Generate eval data
-        eval_gen = OnlineDataGenerator(self.config)
+        # Create smaller config for evaluation to avoid OOM
+        eval_config = TrainConfig(
+            max_train_samples=256,  # Smaller for eval
+            eval_samples=64,
+            max_features=32,
+            max_classes=self.config.max_classes,
+            is_regression=self.config.is_regression,
+            batch_size=1,  # Process one at a time
+        )
+        eval_gen = OnlineDataGenerator(eval_config)
         eval_loader = DataLoader(
             eval_gen,
-            batch_size=self.config.batch_size,
+            batch_size=1,
             collate_fn=collate_variable_size,
         )
         
@@ -475,7 +505,7 @@ class Trainer:
         total_correct = 0
         total_samples = 0
         
-        with torch.no_grad():
+        with torch.no_grad(), self.autocast_ctx:
             for i, batch in enumerate(eval_loader):
                 if i >= 10:  # Evaluate on 10 batches
                     break
@@ -619,6 +649,16 @@ def main():
     parser.add_argument('--data', type=str, default=None, help='HDF5 data path')
     parser.add_argument('--online', action='store_true', help='Generate data on-the-fly')
     
+    # Data generation
+    parser.add_argument('--max_train_samples', type=int, default=2048,
+                       help='Max training samples per dataset')
+    parser.add_argument('--eval_samples', type=int, default=128,
+                       help='Fixed validation set size')
+    parser.add_argument('--max_features', type=int, default=160,
+                       help='Max features per dataset')
+    parser.add_argument('--max_table_cells', type=int, default=75000,
+                       help='Max cells to avoid memory peaks')
+    
     # Model
     parser.add_argument('--embedding_size', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=4)
@@ -628,6 +668,8 @@ def main():
     # Training
     parser.add_argument('--steps', type=int, default=100000)
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                       help='Accumulate gradients over N micro-batches')
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup_steps', type=int, default=1000)
     
@@ -654,16 +696,21 @@ def main():
         args.online = True
     
     config = TrainConfig(
+        max_train_samples=args.max_train_samples,
+        eval_samples=args.eval_samples,
+        max_features=args.max_features,
+        max_classes=args.max_classes,
+        max_table_cells=args.max_table_cells,
         embedding_size=args.embedding_size,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         mlp_hidden=args.mlp_hidden,
         n_steps=args.steps,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr,
         warmup_steps=args.warmup_steps,
         is_regression=args.regression,
-        max_classes=args.max_classes,
         n_bins=args.n_bins,
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,

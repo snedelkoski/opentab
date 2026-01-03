@@ -42,6 +42,7 @@ dependencies = [
     "openml>=0.15.1",
     "schedulefree>=1.4.1",
     "ray>=2.52.1",
+    "tables>=3.10.2",
 ]
 
 [project.optional-dependencies]
