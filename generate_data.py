@@ -1,38 +1,29 @@
 """
 generate_data.py - Synthetic Data Generation for OpenTab Training
 
-This module implements various "priors" - ways to generate synthetic tabular
-datasets that cover the space of real-world data-generating processes.
+This module implements the SCM-based synthetic data generation approach from the TabPFN paper.
+The approach uses Structural Causal Models (SCMs) to generate diverse synthetic tabular datasets
+that capture characteristics of real-world data.
 
-Key Insight: OpenTab is trained on synthetic data, not real datasets, like it's inspiration TabPFN. The 
-quality and diversity of synthetic data determines what the model can learn.
+Key Components:
+1. Graph Structure Sampling: Growing network with redirection (preferential attachment)
+2. Computational Edge Mappings: Neural networks, decision trees, categorical discretization
+3. Initialization Data Sampling: Normal, uniform, mixed with prototype-based non-independence
+4. Post-processing: Kumaraswamy warping, quantization, missing values
 
-Available Priors:
-1. MLPPrior: Random neural networks as data-generating functions
-2. GPPrior: Gaussian Processes with random kernels
-3. TreePrior: Random decision trees / boolean functions
-4. SCMPrior: Structural Causal Models (DAG-based)
-
-Each prior generates:
-- X: Features (random input points)
-- y: Targets (outputs of the random function)
-- Train/test split position
-
-References:
-- TabPFN paper: "TabPFN: A Transformer That Solves Small Tabular Classification Problems"
-- TICL: microsoft/ticl - Prior implementations
-- TabICL: soda-inria/tabicl - Alternative prior
+Reference:
+- "TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second"
 """
 
 import argparse
-import math
 import random
-from typing import Tuple, Optional, Dict, Any, Callable, List
-from dataclasses import dataclass
+import os
+from typing import Tuple, Optional, Dict, Callable, List
+from dataclasses import dataclass, field
+from functools import partial
+import multiprocessing as mp
 
 import numpy as np
-import torch
-import torch.nn as nn
 import h5py
 from tqdm import tqdm
 
@@ -44,1176 +35,945 @@ class SyntheticDataset:
     y: np.ndarray  # (n_samples,)
     train_size: int  # Number of training samples
     n_classes: int  # Number of classes (for classification), 0 for regression
-    is_regression: bool = False  # Whether this is a regression task
-    categorical_mask: Optional[np.ndarray] = None  # (n_features,) bool - True if feature is categorical
-    missing_mask: Optional[np.ndarray] = None  # (n_samples, n_features) bool - True if value is missing
-    n_categories: Optional[np.ndarray] = None  # (n_features,) int - number of categories per feature (0 if continuous)
+    is_regression: bool = False
+    categorical_mask: Optional[np.ndarray] = None  # (n_features,) bool
+    missing_mask: Optional[np.ndarray] = None  # (n_samples, n_features) bool
+    n_categories: Optional[np.ndarray] = None  # (n_features,) int
+
+
+@dataclass
+class SCMHyperparameters:
+    """
+    High-level hyperparameters governing the synthetic dataset properties.
+    Sampled at the start of each dataset generation.
+    """
+    # Graph structure
+    n_nodes: int = 20  # Number of nodes in the DAG
+    redirection_prob: float = 0.3  # Probability of edge redirection in preferential attachment
+    n_subgraphs: int = 1  # Number of disjoint subgraphs to merge
+    
+    # Node dimensions
+    node_dim: int = 8  # Dimension of vectors at each node
+    
+    # Dataset size
+    n_samples: int = 100
+    n_features: int = 10
+    n_classes: int = 2  # For classification; 0 for regression
+    
+    # Initialization
+    init_type: str = 'normal'  # 'normal', 'uniform', or 'mixed'
+    init_scale: float = 1.0
+    prototype_fraction: float = 0.0  # Fraction of samples as prototypes (0 = independent)
+    prototype_temperature: float = 1.0  # Temperature for prototype mixing
+    
+    # Edge mappings
+    edge_noise_std: float = 0.1
+    
+    # Post-processing
+    apply_kumaraswamy: bool = False
+    kumaraswamy_a: float = 1.0
+    kumaraswamy_b: float = 1.0
+    quantization_prob: float = 0.0
+    missing_prob: float = 0.0
+
+
+def sample_hyperparameters(
+    n_samples_range: Tuple[int, int] = (10, 512),
+    n_features_range: Tuple[int, int] = (1, 160),
+    n_classes_range: Tuple[int, int] = (2, 10),
+    node_dim_range: Tuple[int, int] = (4, 16),
+    is_regression: bool = False,
+    max_cells: int = 75000,
+) -> SCMHyperparameters:
+    """
+    Sample high-level hyperparameters for dataset generation.
+    Following the paper, hyperparameters are sampled from specific distributions.
+    
+    Paper specifications:
+    - n_samples: uniform up to 2048 (we use configurable max, default 512)
+    - n_features: Beta(0.95, 8.0) scaled to [1, 160]
+    - max_cells: 75,000 (reduce samples if n_samples * n_features exceeds this)
+    """
+    # Graph size: log-uniform distribution
+    n_nodes_min, n_nodes_max = 10, 50
+    n_nodes = int(np.exp(random.uniform(np.log(n_nodes_min), np.log(n_nodes_max))))
+    
+    # Redirection probability: Gamma distribution
+    # Smaller values lead to denser graphs
+    alpha, beta = 2.0, 5.0
+    redirection_prob = min(0.9, np.random.gamma(alpha, 1/beta))
+    
+    # Number of subgraphs (sometimes features are independent of target)
+    n_subgraphs = random.choices([1, 2, 3], weights=[0.7, 0.2, 0.1])[0]
+    
+    # Node dimension
+    node_dim = random.randint(*node_dim_range)
+    
+    # Dataset properties
+    # Paper: n_samples uniform up to max
+    n_samples = random.randint(*n_samples_range)
+    
+    # Paper: n_features from Beta(k=0.95, b=8.0) scaled to [1, 160]
+    beta_sample = np.random.beta(0.95, 8.0)  # Sample in [0, 1]
+    n_features_min, n_features_max = n_features_range
+    n_features = int(beta_sample * (n_features_max - n_features_min) + n_features_min)
+    n_features = max(n_features_min, min(n_features_max, n_features))
+    
+    # Paper: Cap table size at 75,000 cells by reducing samples for large feature counts
+    if n_samples * n_features > max_cells:
+        n_samples = max(1, max_cells // n_features)
+    n_classes = 0 if is_regression else random.randint(*n_classes_range)
+    
+    # Initialization type
+    init_type = random.choice(['normal', 'uniform', 'mixed'])
+    init_scale = random.uniform(0.5, 2.0)
+    
+    # Prototype-based non-independence (occasionally)
+    if random.random() < 0.3:
+        prototype_fraction = random.uniform(0.1, 0.5)
+        prototype_temperature = random.uniform(0.1, 2.0)
+    else:
+        prototype_fraction = 0.0
+        prototype_temperature = 1.0
+    
+    # Edge noise
+    edge_noise_std = random.uniform(0.01, 0.3)
+    
+    # Post-processing probabilities
+    # Paper: Kumaraswamy applied to "some datasets" - we use 20% of datasets, 50% of features within
+    apply_kumaraswamy = random.random() < 0.2
+    kumaraswamy_a = random.uniform(0.5, 2.0) if apply_kumaraswamy else 1.0
+    kumaraswamy_b = random.uniform(0.5, 2.0) if apply_kumaraswamy else 1.0
+    quantization_prob = random.uniform(0.0, 0.5) if random.random() < 0.4 else 0.0
+    missing_prob = random.uniform(0.0, 0.3) if random.random() < 0.3 else 0.0
+    
+    return SCMHyperparameters(
+        n_nodes=n_nodes,
+        redirection_prob=redirection_prob,
+        n_subgraphs=n_subgraphs,
+        node_dim=node_dim,
+        n_samples=n_samples,
+        n_features=n_features,
+        n_classes=n_classes,
+        init_type=init_type,
+        init_scale=init_scale,
+        prototype_fraction=prototype_fraction,
+        prototype_temperature=prototype_temperature,
+        edge_noise_std=edge_noise_std,
+        apply_kumaraswamy=apply_kumaraswamy,
+        kumaraswamy_a=kumaraswamy_a,
+        kumaraswamy_b=kumaraswamy_b,
+        quantization_prob=quantization_prob,
+        missing_prob=missing_prob,
+    )
 
 
 # ============================================================================
-# Feature Augmentation - Following TabPFN Paper
+# Graph Structure Sampling
 # ============================================================================
 
-class FeatureAugmenter:
+def sample_dag_growing_network(n_nodes: int, redirection_prob: float) -> np.ndarray:
     """
-    Augments synthetic data with realistic real-world characteristics.
+    Sample a DAG using the growing network with redirection method.
     
-    Following TabPFN, this class adds:
-    1. Categorical features (ordinal encoding)
-    2. Missing values (random masking)
-    3. Feature noise and transformations
+    This is a preferential attachment process that generates scale-free networks.
+    Reference: Krapivsky & Redner (2001)
     
-    This is applied AFTER generating base synthetic data from a prior.
+    Args:
+        n_nodes: Number of nodes in the graph
+        redirection_prob: Probability of redirecting an edge to the target's parent
+        
+    Returns:
+        Adjacency matrix (n_nodes, n_nodes) where adj[i,j]=1 means edge from j to i
     """
+    adj = np.zeros((n_nodes, n_nodes))
     
-    def __init__(
-        self,
-        categorical_prob: float = 0.3,  # Probability of a feature being categorical
-        missing_prob: float = 0.1,  # Probability of a value being missing
-        n_categories_range: Tuple[int, int] = (2, 10),  # Range for number of categories
-        missing_indicator_value: float = -999.0,  # Value to use for missing
-        add_noise: bool = True,
-        noise_std: float = 0.01,
-    ):
-        self.categorical_prob = categorical_prob
-        self.missing_prob = missing_prob
-        self.n_categories_range = n_categories_range
-        self.missing_indicator_value = missing_indicator_value
-        self.add_noise = add_noise
-        self.noise_std = noise_std
+    if n_nodes < 2:
+        return adj
     
-    def augment(self, dataset: 'SyntheticDataset') -> 'SyntheticDataset':
-        """
-        Apply augmentations to a synthetic dataset.
-        
-        Args:
-            dataset: A SyntheticDataset with continuous features
-            
-        Returns:
-            Augmented SyntheticDataset with categorical/missing metadata
-        """
-        X = dataset.X.copy()
-        n_samples, n_features = X.shape
-        
-        # Initialize masks
-        categorical_mask = np.zeros(n_features, dtype=bool)
-        n_categories = np.zeros(n_features, dtype=np.int32)
-        missing_mask = np.zeros((n_samples, n_features), dtype=bool)
-        
-        # Apply categorical transformation to random features
-        for i in range(n_features):
-            if random.random() < self.categorical_prob:
-                X, categorical_mask, n_categories = self._make_categorical(
-                    X, i, categorical_mask, n_categories
-                )
-        
-        # Apply missing values
-        if self.missing_prob > 0:
-            X, missing_mask = self._add_missing_values(X, n_samples, n_features)
-        
-        # Add noise to continuous features
-        if self.add_noise:
-            X = self._add_feature_noise(X, categorical_mask, missing_mask)
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=dataset.y,
-            train_size=dataset.train_size,
-            n_classes=dataset.n_classes,
-            is_regression=dataset.is_regression,
-            categorical_mask=categorical_mask,
-            missing_mask=missing_mask,
-            n_categories=n_categories,
-        )
+    # Track parents for each node (for redirection)
+    parents = [[] for _ in range(n_nodes)]
     
-    def _make_categorical(
-        self,
-        X: np.ndarray,
-        feature_idx: int,
-        categorical_mask: np.ndarray,
-        n_categories: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Convert a continuous feature to categorical via binning."""
-        n_cats = random.randint(*self.n_categories_range)
+    for i in range(1, n_nodes):
+        # Pick a random existing node to connect to
+        target = random.randint(0, i - 1)
         
-        # Use percentile-based binning for robustness
-        feature_values = X[:, feature_idx]
-        percentiles = np.linspace(0, 100, n_cats + 1)[1:-1]
-        thresholds = np.percentile(feature_values, percentiles)
+        # With probability redirection_prob, redirect to one of target's parents
+        if parents[target] and random.random() < redirection_prob:
+            target = random.choice(parents[target])
         
-        # Ordinal encode: value becomes integer category
-        X[:, feature_idx] = np.digitize(feature_values, thresholds).astype(np.float32)
+        # Add edge from target to new node i
+        adj[i, target] = 1
+        parents[i].append(target)
         
-        categorical_mask[feature_idx] = True
-        n_categories[feature_idx] = n_cats
-        
-        return X, categorical_mask, n_categories
+        # Occasionally add more edges (to make graph denser)
+        n_extra_edges = np.random.poisson(0.5)
+        for _ in range(n_extra_edges):
+            potential_target = random.randint(0, i - 1)
+            if adj[i, potential_target] == 0:
+                adj[i, potential_target] = 1
+                parents[i].append(potential_target)
     
-    def _add_missing_values(
-        self,
-        X: np.ndarray,
-        n_samples: int,
-        n_features: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Add missing values following TabPFN patterns."""
-        missing_mask = np.zeros((n_samples, n_features), dtype=bool)
-        
-        # Different missing patterns (TabPFN uses multiple)
-        pattern = random.choice(['random', 'column', 'row', 'block'])
-        
-        if pattern == 'random':
-            # Completely random missingness
-            missing_mask = np.random.rand(n_samples, n_features) < self.missing_prob
-            
-        elif pattern == 'column':
-            # Some columns have high missingness
-            n_missing_cols = random.randint(1, max(1, n_features // 3))
-            missing_cols = np.random.choice(n_features, n_missing_cols, replace=False)
-            for col in missing_cols:
-                col_missing_prob = random.uniform(0.1, 0.5)
-                missing_mask[:, col] = np.random.rand(n_samples) < col_missing_prob
-                
-        elif pattern == 'row':
-            # Some rows have high missingness
-            n_missing_rows = random.randint(1, max(1, n_samples // 5))
-            missing_rows = np.random.choice(n_samples, n_missing_rows, replace=False)
-            for row in missing_rows:
-                n_missing_features = random.randint(1, max(1, n_features // 2))
-                missing_features = np.random.choice(n_features, n_missing_features, replace=False)
-                missing_mask[row, missing_features] = True
-                
-        elif pattern == 'block':
-            # Block missingness (correlated)
-            block_size = random.randint(2, max(2, min(n_samples // 4, n_features // 2)))
-            start_row = random.randint(0, max(0, n_samples - block_size))
-            start_col = random.randint(0, max(0, n_features - block_size))
-            n_block_rows = min(block_size, n_samples - start_row)
-            n_block_cols = min(block_size, n_features - start_col)
-            missing_mask[start_row:start_row+n_block_rows, start_col:start_col+n_block_cols] = True
-        
-        # Ensure at least some non-missing values per feature
-        for col in range(n_features):
-            if missing_mask[:, col].sum() > n_samples * 0.8:
-                # Keep at least 20% non-missing
-                missing_idx = np.where(missing_mask[:, col])[0]
-                n_to_keep = int(n_samples * 0.2)
-                keep_idx = np.random.choice(missing_idx, min(len(missing_idx), n_to_keep), replace=False)
-                missing_mask[keep_idx, col] = False
-        
-        # Apply missing indicator value
-        X[missing_mask] = self.missing_indicator_value
-        
-        return X, missing_mask
-    
-    def _add_feature_noise(
-        self,
-        X: np.ndarray,
-        categorical_mask: np.ndarray,
-        missing_mask: np.ndarray,
-    ) -> np.ndarray:
-        """Add small noise to continuous features (not categorical or missing)."""
-        continuous_mask = ~categorical_mask
-        for i in range(X.shape[1]):
-            if continuous_mask[i]:
-                # Add noise only to non-missing values
-                non_missing = ~missing_mask[:, i]
-                if non_missing.any():
-                    feature_std = X[non_missing, i].std() + 1e-8
-                    noise = np.random.randn(non_missing.sum()) * self.noise_std * feature_std
-                    X[non_missing, i] += noise
-        return X
+    return adj
 
 
-class AugmentedPrior:
+def sample_dag_with_subgraphs(
+    n_nodes: int,
+    redirection_prob: float,
+    n_subgraphs: int,
+) -> np.ndarray:
     """
-    Wrapper that applies FeatureAugmenter to any base prior.
+    Sample a DAG that may consist of multiple disjoint subgraphs.
     
-    This combines synthetic data generation with realistic augmentation,
-    following the TabPFN approach.
-    
-    Usage:
-        base_prior = MixedPrior()
-        augmented = AugmentedPrior(base_prior, categorical_prob=0.3, missing_prob=0.1)
-        dataset = augmented.generate(n_samples=100, n_features=10, n_classes=2)
+    Disjoint subgraphs lead to features that are marginally independent
+    of the target if not connected to the target node.
     """
+    if n_subgraphs <= 1:
+        return sample_dag_growing_network(n_nodes, redirection_prob)
     
-    def __init__(
-        self,
-        base_prior: Any,
-        categorical_prob: float = 0.3,
-        missing_prob: float = 0.1,
-        n_categories_range: Tuple[int, int] = (2, 10),
-        augment_prob: float = 0.7,  # Probability of applying augmentation
-    ):
-        self.base_prior = base_prior
-        self.augmenter = FeatureAugmenter(
-            categorical_prob=categorical_prob,
-            missing_prob=missing_prob,
-            n_categories_range=n_categories_range,
-        )
-        self.augment_prob = augment_prob
+    # Divide nodes among subgraphs
+    nodes_per_subgraph = n_nodes // n_subgraphs
+    adj = np.zeros((n_nodes, n_nodes))
     
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        n_classes: int = 2,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate an augmented synthetic dataset."""
-        # Generate base dataset
-        dataset = self.base_prior.generate(n_samples, n_features, n_classes, train_ratio)
+    start = 0
+    for s in range(n_subgraphs):
+        end = start + nodes_per_subgraph if s < n_subgraphs - 1 else n_nodes
+        subgraph_size = end - start
         
-        # Apply augmentation with some probability
-        if random.random() < self.augment_prob:
-            dataset = self.augmenter.augment(dataset)
-        else:
-            # No augmentation - still create empty masks
-            dataset = SyntheticDataset(
-                X=dataset.X,
-                y=dataset.y,
-                train_size=dataset.train_size,
-                n_classes=dataset.n_classes,
-                is_regression=dataset.is_regression,
-                categorical_mask=np.zeros(n_features, dtype=bool),
-                missing_mask=np.zeros((n_samples, n_features), dtype=bool),
-                n_categories=np.zeros(n_features, dtype=np.int32),
-            )
+        if subgraph_size > 1:
+            sub_adj = sample_dag_growing_network(subgraph_size, redirection_prob)
+            adj[start:end, start:end] = sub_adj
         
-        return dataset
+        start = end
+    
+    return adj
 
 
-class AugmentedRegressionPrior:
-    """
-    Wrapper that applies FeatureAugmenter to regression priors.
-    """
-    
-    def __init__(
-        self,
-        base_prior: Any,
-        categorical_prob: float = 0.3,
-        missing_prob: float = 0.1,
-        n_categories_range: Tuple[int, int] = (2, 10),
-        augment_prob: float = 0.7,
-    ):
-        self.base_prior = base_prior
-        self.augmenter = FeatureAugmenter(
-            categorical_prob=categorical_prob,
-            missing_prob=missing_prob,
-            n_categories_range=n_categories_range,
-        )
-        self.augment_prob = augment_prob
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate an augmented synthetic regression dataset."""
-        # Generate base dataset
-        dataset = self.base_prior.generate(n_samples, n_features, train_ratio)
-        
-        # Apply augmentation with some probability
-        if random.random() < self.augment_prob:
-            dataset = self.augmenter.augment(dataset)
-        else:
-            dataset = SyntheticDataset(
-                X=dataset.X,
-                y=dataset.y,
-                train_size=dataset.train_size,
-                n_classes=0,
-                is_regression=True,
-                categorical_mask=np.zeros(n_features, dtype=bool),
-                missing_mask=np.zeros((n_samples, n_features), dtype=bool),
-                n_categories=np.zeros(n_features, dtype=np.int32),
-            )
-        
-        return dataset
+# ============================================================================
+# Activation Functions for Edge Mappings
+# ============================================================================
+
+ACTIVATION_FUNCTIONS = {
+    # Paper: identity, logarithm, sigmoid, absolute, sine, tanh, rank, squaring, power, smooth ReLU, step, modulo
+    'identity': lambda x: x,
+    'relu': lambda x: np.maximum(0, x),
+    'sigmoid': lambda x: 1 / (1 + np.exp(-np.clip(x, -500, 500))),
+    'tanh': np.tanh,
+    'sin': np.sin,
+    'abs': np.abs,
+    'square': lambda x: x ** 2,
+    'sqrt_abs': lambda x: np.sqrt(np.abs(x) + 1e-8),
+    'log': lambda x: np.log(np.abs(x) + 1e-8),  # logarithm from paper
+    'step': lambda x: (x > 0).astype(float),
+    'softplus': lambda x: np.log1p(np.exp(np.clip(x, -20, 20))),  # smooth ReLU from paper
+    'modulo': lambda x: np.mod(x, 1.0),
+    'power_2': lambda x: np.clip(x, -10, 10) ** 2,
+    'power_3': lambda x: np.clip(x, -10, 10) ** 3,
+    'power_4': lambda x: np.clip(x, -10, 10) ** 4,
+    'power_5': lambda x: np.clip(x, -10, 10) ** 5,
+    'rank': lambda x: np.argsort(np.argsort(x, axis=0), axis=0).astype(float) / (x.shape[0] - 1 + 1e-8),
+}
 
 
-class MLPPrior:
-    """
-    Generate data using random Multi-Layer Perceptrons.
-    
-    Each MLP represents a random function from features to targets.
-    The architecture (layers, activation, weights) is randomly sampled.
-    
-    This prior tends to create smooth, complex decision boundaries.
-    """
-    
-    def __init__(
-        self,
-        n_layers_range: Tuple[int, int] = (1, 4),
-        hidden_size_range: Tuple[int, int] = (16, 128),
-        activation_options: List[str] = ['relu', 'tanh', 'gelu', 'sigmoid'],
-        weight_scale: float = 1.0,
-        noise_std: float = 0.01,
-    ):
-        self.n_layers_range = n_layers_range
-        self.hidden_size_range = hidden_size_range
-        self.activation_options = activation_options
-        self.weight_scale = weight_scale
-        self.noise_std = noise_std
-    
-    def _get_activation(self, name: str) -> Callable:
-        activations = {
-            'relu': lambda x: np.maximum(0, x),
-            'tanh': np.tanh,
-            'gelu': lambda x: 0.5 * x * (1 + np.tanh(np.sqrt(2/np.pi) * (x + 0.044715 * x**3))),
-            'sigmoid': lambda x: 1 / (1 + np.exp(-np.clip(x, -500, 500))),
-            'leaky_relu': lambda x: np.where(x > 0, x, 0.01 * x),
-        }
-        return activations.get(name, activations['relu'])
-    
-    def sample_function(
-        self,
-        n_features: int,
-        n_outputs: int = 1,
-    ) -> Callable[[np.ndarray], np.ndarray]:
-        """Sample a random MLP function."""
-        # Sample architecture
-        n_layers = random.randint(*self.n_layers_range)
-        hidden_sizes = [random.randint(*self.hidden_size_range) for _ in range(n_layers)]
-        activation = self._get_activation(random.choice(self.activation_options))
-        
-        # Sample weights
-        layer_sizes = [n_features] + hidden_sizes + [n_outputs]
-        weights = []
-        biases = []
-        
-        for i in range(len(layer_sizes) - 1):
-            # Xavier initialization with scaling
-            scale = self.weight_scale * np.sqrt(2.0 / (layer_sizes[i] + layer_sizes[i+1]))
-            W = np.random.randn(layer_sizes[i], layer_sizes[i+1]) * scale
-            b = np.random.randn(layer_sizes[i+1]) * scale * 0.1
-            weights.append(W)
-            biases.append(b)
-        
-        def forward(X: np.ndarray) -> np.ndarray:
-            h = X
-            for i, (W, b) in enumerate(zip(weights, biases)):
-                h = h @ W + b
-                if i < len(weights) - 1:  # Apply activation except last layer
-                    h = activation(h)
-            return h
-        
-        return forward
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        n_classes: int = 2,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic classification dataset."""
-        # Sample input features
-        X = self._sample_features(n_samples, n_features)
-        
-        # Sample and apply random function
-        func = self.sample_function(n_features, n_outputs=n_classes)
-        logits = func(X)
-        
-        # Clip to prevent overflow and handle NaN/Inf
-        logits = np.clip(logits, -1e6, 1e6)
-        logits = np.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        # Add noise and convert to classes
-        logits += np.random.randn(*logits.shape) * self.noise_std
-        y = logits.argmax(axis=1)
-        
-        # Determine train/test split
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)  # At least 1 test sample
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.int64),
-            train_size=train_size,
-            n_classes=n_classes,
-        )
-    
-    def _sample_features(self, n_samples: int, n_features: int) -> np.ndarray:
-        """Sample feature values from various distributions."""
-        X = np.zeros((n_samples, n_features))
-        
-        for i in range(n_features):
-            dist_type = random.choice(['uniform', 'normal', 'mixture'])
-            
-            if dist_type == 'uniform':
-                low = random.uniform(-10, 0)
-                high = random.uniform(0, 10)
-                X[:, i] = np.random.uniform(low, high, n_samples)
-            elif dist_type == 'normal':
-                mean = random.uniform(-5, 5)
-                std = random.uniform(0.1, 3)
-                X[:, i] = np.random.normal(mean, std, n_samples)
-            else:  # mixture
-                n_components = random.randint(2, 4)
-                means = np.random.uniform(-5, 5, n_components)
-                stds = np.random.uniform(0.1, 2, n_components)
-                component_idx = np.random.choice(n_components, n_samples)
-                X[:, i] = np.array([
-                    np.random.normal(means[c], stds[c])
-                    for c in component_idx
-                ])
-        
-        return X
+def get_random_activation() -> Callable:
+    """Sample a random activation function."""
+    name = random.choice(list(ACTIVATION_FUNCTIONS.keys()))
+    return ACTIVATION_FUNCTIONS[name]
 
 
-class GPPrior:
+# ============================================================================
+# Computational Edge Mappings
+# ============================================================================
+
+class NeuralNetworkMapping:
     """
-    Generate data using Gaussian Processes.
+    Small neural network as edge mapping.
     
-    GPs provide smooth function samples with controllable properties.
-    Different kernel parameters create different types of functions.
-    
-    This prior tends to create smooth, continuous decision boundaries.
+    Applies a linear transformation followed by an element-wise nonlinearity.
+    Uses Xavier initialization for weights.
     """
     
-    def __init__(
-        self,
-        lengthscale_range: Tuple[float, float] = (0.1, 2.0),
-        outputscale_range: Tuple[float, float] = (0.5, 2.0),
-        noise_std: float = 0.01,
-    ):
-        self.lengthscale_range = lengthscale_range
-        self.outputscale_range = outputscale_range
-        self.noise_std = noise_std
+    def __init__(self, input_dim: int, output_dim: int, n_hidden_layers: int = 1):
+        self.layers = []
+        
+        dims = [input_dim]
+        for _ in range(n_hidden_layers):
+            dims.append(random.randint(input_dim, max(input_dim, output_dim)))
+        dims.append(output_dim)
+        
+        for i in range(len(dims) - 1):
+            # Xavier initialization
+            scale = np.sqrt(2.0 / (dims[i] + dims[i+1]))
+            W = np.random.randn(dims[i], dims[i+1]) * scale
+            b = np.random.randn(dims[i+1]) * scale * 0.1
+            activation = get_random_activation() if i < len(dims) - 2 else ACTIVATION_FUNCTIONS['identity']
+            self.layers.append((W, b, activation))
     
-    def _rbf_kernel(
-        self, 
-        X1: np.ndarray, 
-        X2: np.ndarray, 
-        lengthscale: float,
-        outputscale: float,
-    ) -> np.ndarray:
-        """Compute RBF (squared exponential) kernel matrix."""
-        # Compute squared distances
-        X1_sq = np.sum(X1**2, axis=1, keepdims=True)
-        X2_sq = np.sum(X2**2, axis=1, keepdims=True)
-        dist_sq = X1_sq + X2_sq.T - 2 * X1 @ X2.T
-        
-        # Apply RBF kernel
-        K = outputscale * np.exp(-0.5 * dist_sq / lengthscale**2)
-        return K
-    
-    def sample_function_values(
-        self,
-        X: np.ndarray,
-    ) -> np.ndarray:
-        """Sample function values at given points from a GP."""
-        n_samples = X.shape[0]
-        
-        # Sample kernel hyperparameters
-        lengthscale = random.uniform(*self.lengthscale_range)
-        outputscale = random.uniform(*self.outputscale_range)
-        
-        # Compute kernel matrix
-        K = self._rbf_kernel(X, X, lengthscale, outputscale)
-        
-        # Add jitter for numerical stability
-        K += np.eye(n_samples) * 1e-6
-        
-        # Sample from GP (multivariate normal with covariance K)
-        try:
-            L = np.linalg.cholesky(K)
-            z = np.random.randn(n_samples)
-            f = L @ z
-        except np.linalg.LinAlgError:
-            # Fallback if Cholesky fails
-            f = np.random.randn(n_samples)
-        
-        return f
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        n_classes: int = 2,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic classification dataset."""
-        # Sample input features (uniform for GP)
-        X = np.random.uniform(-3, 3, (n_samples, n_features))
-        
-        # Sample GP function values for each class
-        logits = np.zeros((n_samples, n_classes))
-        for c in range(n_classes):
-            logits[:, c] = self.sample_function_values(X)
-        
-        # Clip to prevent overflow and handle NaN/Inf
-        logits = np.clip(logits, -1e6, 1e6)
-        logits = np.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        # Add noise and convert to classes
-        logits += np.random.randn(*logits.shape) * self.noise_std
-        y = logits.argmax(axis=1)
-        
-        # Determine train/test split
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.int64),
-            train_size=train_size,
-            n_classes=n_classes,
-        )
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Apply the neural network mapping. x: (n_samples, input_dim)"""
+        h = x
+        for W, b, activation in self.layers:
+            h = h @ W + b
+            h = activation(h)
+        return h
 
 
-class TreePrior:
+class DecisionTreeMapping:
     """
-    Generate data using random decision trees.
+    Decision tree as edge mapping.
     
-    Creates axis-aligned decision boundaries by recursively splitting
-    feature space. Good for capturing discrete/rule-based patterns.
+    Implements rule-based dependencies by selecting features and
+    applying thresholds to determine the output.
     """
     
-    def __init__(
-        self,
-        max_depth_range: Tuple[int, int] = (2, 6),
-        noise_std: float = 0.01,
-    ):
-        self.max_depth_range = max_depth_range
-        self.noise_std = noise_std
+    def __init__(self, input_dim: int, output_dim: int, max_depth: int = 4):
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.tree = self._build_tree(max_depth, depth=0)
     
-    def _build_tree(
-        self,
-        n_features: int,
-        n_classes: int,
-        max_depth: int,
-        depth: int = 0,
-    ) -> Dict[str, Any]:
+    def _build_tree(self, max_depth: int, depth: int) -> Dict:
         """Recursively build a random decision tree."""
-        # Decide whether to split or create leaf
         if depth >= max_depth or random.random() < 0.3:
-            # Leaf node: random class probabilities
-            probs = np.random.dirichlet(np.ones(n_classes) * 0.5)
-            return {'type': 'leaf', 'probs': probs}
+            # Leaf: random output vector
+            return {'type': 'leaf', 'value': np.random.randn(self.output_dim)}
         
-        # Internal node: random split
-        feature_idx = random.randint(0, n_features - 1)
+        # Internal node: split on a random feature dimension
+        feature_idx = random.randint(0, self.input_dim - 1)
         threshold = random.uniform(-2, 2)
-        
-        left = self._build_tree(n_features, n_classes, max_depth, depth + 1)
-        right = self._build_tree(n_features, n_classes, max_depth, depth + 1)
         
         return {
             'type': 'split',
             'feature': feature_idx,
             'threshold': threshold,
-            'left': left,
-            'right': right,
+            'left': self._build_tree(max_depth, depth + 1),
+            'right': self._build_tree(max_depth, depth + 1),
         }
     
-    def _evaluate_tree(
-        self,
-        tree: Dict[str, Any],
-        X: np.ndarray,
-        n_classes: int,
-    ) -> np.ndarray:
-        """Evaluate decision tree on data."""
-        n_samples = X.shape[0]
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Apply the decision tree. x: (n_samples, input_dim)"""
+        n_samples = x.shape[0]
+        output = np.zeros((n_samples, self.output_dim))
         
-        if tree['type'] == 'leaf':
-            return np.tile(tree['probs'], (n_samples, 1))
+        for i in range(n_samples):
+            output[i] = self._evaluate(self.tree, x[i])
         
-        # Evaluate split
-        mask = X[:, tree['feature']] < tree['threshold']
-        
-        result = np.zeros((n_samples, n_classes))
-        
-        if mask.any():
-            result[mask] = self._evaluate_tree(tree['left'], X[mask], n_classes)
-        if (~mask).any():
-            result[~mask] = self._evaluate_tree(tree['right'], X[~mask], n_classes)
-        
-        return result
+        return output
     
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        n_classes: int = 2,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic classification dataset."""
-        # Sample features
-        X = np.random.uniform(-3, 3, (n_samples, n_features))
+    def _evaluate(self, node: Dict, x: np.ndarray) -> np.ndarray:
+        """Evaluate tree on a single sample."""
+        if node['type'] == 'leaf':
+            return node['value']
         
-        # Build and evaluate random tree
-        max_depth = random.randint(*self.max_depth_range)
-        tree = self._build_tree(n_features, n_classes, max_depth)
-        probs = self._evaluate_tree(tree, X, n_classes)
-        
-        # Ensure probs has correct shape
-        if probs.shape[1] != n_classes:
-            probs = np.random.dirichlet(np.ones(n_classes), n_samples)
-        
-        # Add noise and sample classes
-        probs += np.random.randn(*probs.shape) * self.noise_std
-        probs = np.clip(probs, 1e-10, None)
-        probs = probs / probs.sum(axis=1, keepdims=True)
-        
-        y = np.array([np.random.choice(n_classes, p=p) for p in probs])
-        
-        # Determine train/test split
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.int64),
-            train_size=train_size,
-            n_classes=n_classes,
-        )
-
-
-class SCMPrior:
-    """
-    Generate data using Structural Causal Models.
-    
-    Creates a random DAG and assigns random causal mechanisms to each node.
-    This captures causal relationships between features and target.
-    
-    More realistic but also more complex than other priors.
-    """
-    
-    def __init__(
-        self,
-        mechanism_types: List[str] = ['linear', 'mlp', 'polynomial'],
-        noise_std: float = 0.1,
-        edge_prob: float = 0.3,
-    ):
-        self.mechanism_types = mechanism_types
-        self.noise_std = noise_std
-        self.edge_prob = edge_prob
-    
-    def _sample_dag(self, n_nodes: int) -> np.ndarray:
-        """Sample a random DAG adjacency matrix."""
-        # Lower triangular ensures DAG (no cycles)
-        adj = np.random.rand(n_nodes, n_nodes) < self.edge_prob
-        adj = np.tril(adj, k=-1).astype(float)
-        return adj
-    
-    def _sample_mechanism(
-        self, 
-        mechanism_type: str,
-        n_parents: int,
-    ) -> Callable[[np.ndarray], np.ndarray]:
-        """Sample a random causal mechanism."""
-        if mechanism_type == 'linear':
-            weights = np.random.randn(n_parents) * 0.5
-            bias = np.random.randn() * 0.5
-            return lambda x: x @ weights + bias
-        
-        elif mechanism_type == 'polynomial':
-            degree = random.randint(1, 3)
-            coeffs = [np.random.randn(n_parents) * (0.5 ** d) for d in range(degree + 1)]
-            def poly(x):
-                # Clip x to prevent overflow in power operation
-                x_clipped = np.clip(x, -10, 10)
-                result = coeffs[0].sum()  # Bias
-                for d, c in enumerate(coeffs[1:], 1):
-                    x_pow = np.clip(x_clipped ** d, -1e6, 1e6)
-                    result += (x_pow @ c)
-                return np.clip(result, -1e6, 1e6)
-            return poly
-        
-        else:  # mlp
-            hidden_size = random.randint(8, 32)
-            W1 = np.random.randn(n_parents, hidden_size) * 0.5
-            b1 = np.random.randn(hidden_size) * 0.1
-            W2 = np.random.randn(hidden_size) * 0.5
-            b2 = np.random.randn() * 0.1
-            def mlp(x):
-                h = np.maximum(0, x @ W1 + b1)  # ReLU
-                return h @ W2 + b2
-            return mlp
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        n_classes: int = 2,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic classification dataset."""
-        n_nodes = n_features + 1  # Features + target
-        
-        # Sample DAG structure
-        adj = self._sample_dag(n_nodes)
-        
-        # Sample mechanisms for each node
-        mechanisms = []
-        for i in range(n_nodes):
-            parents = np.where(adj[i] > 0)[0]
-            if len(parents) == 0:
-                # No parents: sample from prior
-                mechanisms.append(lambda x: np.random.randn(n_samples))
-            else:
-                mech_type = random.choice(self.mechanism_types)
-                mechanisms.append(self._sample_mechanism(mech_type, len(parents)))
-        
-        # Generate data by ancestral sampling
-        data = np.zeros((n_samples, n_nodes))
-        
-        for i in range(n_nodes):
-            parents = np.where(adj[i] > 0)[0]
-            if len(parents) == 0:
-                data[:, i] = np.random.randn(n_samples)
-            else:
-                parent_values = data[:, parents]
-                data[:, i] = mechanisms[i](parent_values) + np.random.randn(n_samples) * self.noise_std
-        
-        # Split into features and target
-        X = data[:, :n_features]
-        target_continuous = data[:, -1]
-        
-        # Clip to prevent overflow when converting to float32
-        X = np.clip(X, -1e6, 1e6)
-        target_continuous = np.clip(target_continuous, -1e6, 1e6)
-        
-        # Handle any NaN/Inf values
-        X = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
-        target_continuous = np.nan_to_num(target_continuous, nan=0.0, posinf=1e6, neginf=-1e6)
-        
-        # Convert to classes
-        if n_classes == 2:
-            y = (target_continuous > np.median(target_continuous)).astype(np.int64)
+        if x[node['feature']] < node['threshold']:
+            return self._evaluate(node['left'], x)
         else:
-            percentiles = np.linspace(0, 100, n_classes + 1)[1:-1]
-            thresholds = np.percentile(target_continuous, percentiles)
-            y = np.digitize(target_continuous, thresholds)
-        
-        # Determine train/test split
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.int64),
-            train_size=train_size,
-            n_classes=n_classes,
-        )
+            return self._evaluate(node['right'], x)
 
 
-class MixedPrior:
+class CategoricalDiscretization:
     """
-    Mixture of multiple priors for diverse training data.
+    Categorical feature discretization via nearest neighbor.
     
-    Randomly selects from available priors for each dataset.
-    This increases the diversity of training data.
+    Maps continuous vectors to the index of the nearest prototype,
+    then embeds that index back to a continuous vector.
+    """
+    
+    def __init__(self, input_dim: int, output_dim: int, n_categories: int = None):
+        if n_categories is None:
+            # Sample number of categories from gamma distribution with offset
+            n_categories = int(np.random.gamma(2, 2)) + 2
+        self.n_categories = min(n_categories, 10)  # Max 10 classes per paper
+        
+        # Random prototype vectors for each category
+        self.prototypes = np.random.randn(self.n_categories, input_dim)
+        
+        # Embedding vectors to continue propagation
+        self.embeddings = np.random.randn(self.n_categories, output_dim)
+    
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """Apply discretization. x: (n_samples, input_dim)"""
+        # Find nearest prototype for each sample
+        # distances: (n_samples, n_categories)
+        distances = np.sum((x[:, np.newaxis, :] - self.prototypes[np.newaxis, :, :]) ** 2, axis=2)
+        category_idx = np.argmin(distances, axis=1)
+        
+        # Return embeddings for the assigned categories
+        return self.embeddings[category_idx]
+    
+    def get_categories(self, x: np.ndarray) -> np.ndarray:
+        """Return category indices for each sample."""
+        distances = np.sum((x[:, np.newaxis, :] - self.prototypes[np.newaxis, :, :]) ** 2, axis=2)
+        return np.argmin(distances, axis=1)
+
+
+def sample_edge_mapping(input_dim: int, output_dim: int) -> Callable:
+    """
+    Sample a random computational edge mapping.
+    
+    Types (from paper):
+    1. Small neural networks with various activations
+    2. Decision trees
+    3. Categorical discretization
+    """
+    mapping_type = random.choices(
+        ['neural_network', 'decision_tree', 'categorical'],
+        weights=[0.6, 0.25, 0.15]
+    )[0]
+    
+    if mapping_type == 'neural_network':
+        n_layers = random.randint(1, 3)
+        return NeuralNetworkMapping(input_dim, output_dim, n_hidden_layers=n_layers)
+    elif mapping_type == 'decision_tree':
+        # Paper doesn't specify max depth, using up to 8 for more complex rule-based dependencies
+        max_depth = random.randint(2, 8)
+        return DecisionTreeMapping(input_dim, output_dim, max_depth=max_depth)
+    else:
+        return CategoricalDiscretization(input_dim, output_dim)
+
+
+# ============================================================================
+# Initialization Data Sampling
+# ============================================================================
+
+def sample_initialization_data(
+    n_samples: int,
+    n_dims: int,
+    init_type: str,
+    init_scale: float,
+    prototype_fraction: float = 0.0,
+    prototype_temperature: float = 1.0,
+) -> np.ndarray:
+    """
+    Generate initialization data for root nodes.
+    
+    Three sampling mechanisms (from paper):
+    1. Normal: ε ~ N(0, σ²I)
+    2. Uniform: ε ~ U(-a, a)
+    3. Mixed: randomly select normal or uniform per root node
+    
+    Non-independence via prototype mixing:
+    - Sample M = ρ*n prototype vectors
+    - For each sample, compute weights α and mix prototypes
+    """
+    # Base sampling
+    if init_type == 'normal':
+        data = np.random.randn(n_samples, n_dims) * init_scale
+    elif init_type == 'uniform':
+        data = np.random.uniform(-init_scale, init_scale, (n_samples, n_dims))
+    else:  # mixed - Paper: "for each root node, we randomly select either normal or uniform"
+        # Since this function is called per root node, we select one distribution for all dims
+        if random.random() < 0.5:
+            data = np.random.randn(n_samples, n_dims) * init_scale
+        else:
+            data = np.random.uniform(-init_scale, init_scale, (n_samples, n_dims))
+    
+    # Apply prototype-based non-independence if specified
+    if prototype_fraction > 0:
+        n_prototypes = max(1, int(prototype_fraction * n_samples))
+        
+        # Sample prototypes from the data itself
+        prototype_indices = np.random.choice(n_samples, n_prototypes, replace=False)
+        prototypes = data[prototype_indices].copy()
+        
+        # For each sample, compute mixing weights
+        # Using softmax over random distances with temperature
+        new_data = np.zeros_like(data)
+        for i in range(n_samples):
+            # Random weights via Dirichlet (controlled by temperature)
+            alpha = np.ones(n_prototypes) * prototype_temperature
+            weights = np.random.dirichlet(alpha)
+            new_data[i] = weights @ prototypes
+        
+        data = new_data
+    
+    return data
+
+
+# ============================================================================
+# Post-Processing
+# ============================================================================
+
+def kumaraswamy_transform(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    """
+    Apply Kumaraswamy distribution warping.
+    
+    The Kumaraswamy distribution introduces nonlinear distortions.
+    CDF: F(x) = 1 - (1 - x^a)^b for x in [0, 1]
+    
+    We first normalize to [0, 1], apply transform, then rescale.
+    """
+    # Normalize to [0, 1]
+    x_min, x_max = x.min(), x.max()
+    if x_max - x_min < 1e-8:
+        return x
+    
+    x_normalized = (x - x_min) / (x_max - x_min + 1e-8)
+    x_normalized = np.clip(x_normalized, 1e-8, 1 - 1e-8)
+    
+    # Apply Kumaraswamy CDF
+    x_transformed = 1 - (1 - x_normalized ** a) ** b
+    
+    # Rescale back to original range
+    return x_transformed * (x_max - x_min) + x_min
+
+
+def quantize_feature(x: np.ndarray, n_bins: int = None) -> np.ndarray:
+    """
+    Quantize a continuous feature into discrete buckets.
+    
+    Mimics binned/discretized features common in real datasets.
+    Paper: K categories with minimum 2 classes.
+    """
+    if n_bins is None:
+        n_bins = random.randint(2, 20)  # Paper: minimum 2 categories
+    
+    # Sample bin edges from the feature values
+    unique_vals = np.unique(x)
+    if len(unique_vals) <= n_bins:
+        return x  # Already discrete enough
+    
+    # Use percentile-based binning
+    percentiles = np.linspace(0, 100, n_bins + 1)
+    bin_edges = np.percentile(x, percentiles[1:-1])
+    
+    return np.digitize(x, bin_edges).astype(float)
+
+
+def add_missing_values(
+    X: np.ndarray,
+    missing_prob: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Introduce missing values using Missing Completely At Random (MCAR).
+    
+    Each value is masked as missing with probability ρ_miss,
+    independently of the data values.
+    
+    Missing values are filled with NaN (float('nan')) to be handled by the model.
+    """
+    missing_mask = np.random.rand(*X.shape) < missing_prob
+    
+    # Ensure at least some non-missing values per feature
+    for j in range(X.shape[1]):
+        if missing_mask[:, j].sum() > X.shape[0] * 0.8:
+            # Keep at least 20% non-missing
+            missing_idx = np.where(missing_mask[:, j])[0]
+            n_to_keep = int(X.shape[0] * 0.2)
+            keep_idx = np.random.choice(missing_idx, min(len(missing_idx), n_to_keep), replace=False)
+            missing_mask[keep_idx, j] = False
+    
+    X_with_missing = X.copy()
+    X_with_missing[missing_mask] = float('nan')  # Use NaN for missing values
+    
+    return X_with_missing, missing_mask
+
+
+def apply_post_processing(
+    X: np.ndarray,
+    hp: SCMHyperparameters,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Apply post-processing to features.
+    
+    Returns:
+        X: Processed features
+        categorical_mask: Boolean mask for categorical features
+        missing_mask: Boolean mask for missing values
+    """
+    n_samples, n_features = X.shape
+    categorical_mask = np.zeros(n_features, dtype=bool)
+    missing_mask = np.zeros((n_samples, n_features), dtype=bool)
+    
+    for j in range(n_features):
+        # Kumaraswamy warping - Paper: applied to some datasets (20%), 50% of features within those
+        if hp.apply_kumaraswamy and random.random() < 0.5:
+            X[:, j] = kumaraswamy_transform(X[:, j], hp.kumaraswamy_a, hp.kumaraswamy_b)
+        
+        # Quantization
+        if random.random() < hp.quantization_prob:
+            X[:, j] = quantize_feature(X[:, j])
+            categorical_mask[j] = True
+    
+    # Missing values (applied to all features together)
+    if hp.missing_prob > 0:
+        X, missing_mask = add_missing_values(X, hp.missing_prob)
+    
+    return X, categorical_mask, missing_mask
+
+
+# ============================================================================
+# SCM-Based Data Generator
+# ============================================================================
+
+class SCMDataGenerator:
+    """
+    Generate synthetic datasets using Structural Causal Models.
+    
+    Following the TabPFN paper, this generator:
+    1. Samples high-level hyperparameters
+    2. Constructs a DAG using preferential attachment
+    3. Assigns computational edge mappings
+    4. Propagates initialization data through the graph
+    5. Extracts features and targets from intermediate representations
+    6. Applies post-processing
     """
     
     def __init__(
         self,
-        priors: Optional[List[Any]] = None,
-        weights: Optional[List[float]] = None,
+        n_samples_range: Tuple[int, int] = (10, 100),
+        n_features_range: Tuple[int, int] = (2, 20),
+        n_classes_range: Tuple[int, int] = (2, 10),
+        is_regression: bool = False,
     ):
-        if priors is None:
-            priors = [MLPPrior(), GPPrior(), TreePrior(), SCMPrior()]
-        if weights is None:
-            weights = [1.0] * len(priors)
-        
-        self.priors = priors
-        self.weights = np.array(weights) / sum(weights)
+        self.n_samples_range = n_samples_range
+        self.n_features_range = n_features_range
+        self.n_classes_range = n_classes_range
+        self.is_regression = is_regression
     
     def generate(
         self,
-        n_samples: int,
-        n_features: int,
-        n_classes: int = 2,
+        n_samples: int = None,
+        n_features: int = None,
+        n_classes: int = None,
         train_ratio: float = 0.7,
     ) -> SyntheticDataset:
-        """Generate a synthetic dataset using a random prior."""
-        prior_idx = np.random.choice(len(self.priors), p=self.weights)
-        return self.priors[prior_idx].generate(
-            n_samples, n_features, n_classes, train_ratio
+        """
+        Generate a single synthetic dataset.
+        
+        Args:
+            n_samples: Number of samples (random if None)
+            n_features: Number of features (random if None)
+            n_classes: Number of classes (random if None, ignored for regression)
+            train_ratio: Fraction of samples for training
+        """
+        # Sample hyperparameters
+        hp = sample_hyperparameters(
+            n_samples_range=self.n_samples_range,
+            n_features_range=self.n_features_range,
+            n_classes_range=self.n_classes_range,
+            is_regression=self.is_regression,
         )
-
-
-# ============================================================================
-# Regression Priors
-# ============================================================================
-
-class MLPRegressionPrior:
-    """
-    Generate regression data using random Multi-Layer Perceptrons.
-    
-    Similar to MLPPrior but outputs continuous values instead of class labels.
-    """
-    
-    def __init__(
-        self,
-        n_layers_range: Tuple[int, int] = (1, 4),
-        hidden_size_range: Tuple[int, int] = (16, 128),
-        activation_options: List[str] = ['relu', 'tanh', 'gelu', 'sigmoid'],
-        weight_scale: float = 1.0,
-        noise_std_range: Tuple[float, float] = (0.01, 0.3),
-    ):
-        self.n_layers_range = n_layers_range
-        self.hidden_size_range = hidden_size_range
-        self.activation_options = activation_options
-        self.weight_scale = weight_scale
-        self.noise_std_range = noise_std_range
-    
-    def _get_activation(self, name: str) -> Callable:
-        activations = {
-            'relu': lambda x: np.maximum(0, x),
-            'tanh': np.tanh,
-            'gelu': lambda x: 0.5 * x * (1 + np.tanh(np.sqrt(2/np.pi) * (x + 0.044715 * x**3))),
-            'sigmoid': lambda x: 1 / (1 + np.exp(-np.clip(x, -500, 500))),
-            'leaky_relu': lambda x: np.where(x > 0, x, 0.01 * x),
-        }
-        return activations.get(name, activations['relu'])
-    
-    def sample_function(self, n_features: int) -> Callable[[np.ndarray], np.ndarray]:
-        """Sample a random MLP function for regression."""
-        n_layers = random.randint(*self.n_layers_range)
-        hidden_sizes = [random.randint(*self.hidden_size_range) for _ in range(n_layers)]
-        activation = self._get_activation(random.choice(self.activation_options))
         
-        layer_sizes = [n_features] + hidden_sizes + [1]
-        weights = []
-        biases = []
+        # Override with provided values
+        if n_samples is not None:
+            hp.n_samples = n_samples
+        if n_features is not None:
+            hp.n_features = n_features
+        if n_classes is not None and not self.is_regression:
+            hp.n_classes = n_classes
         
-        for i in range(len(layer_sizes) - 1):
-            scale = self.weight_scale * np.sqrt(2.0 / (layer_sizes[i] + layer_sizes[i+1]))
-            W = np.random.randn(layer_sizes[i], layer_sizes[i+1]) * scale
-            b = np.random.randn(layer_sizes[i+1]) * scale * 0.1
-            weights.append(W)
-            biases.append(b)
+        # Ensure enough nodes for features and target
+        hp.n_nodes = max(hp.n_nodes, hp.n_features + 1)
         
-        def forward(X: np.ndarray) -> np.ndarray:
-            h = X
-            for i, (W, b) in enumerate(zip(weights, biases)):
-                h = h @ W + b
-                if i < len(weights) - 1:
-                    h = activation(h)
-            return h.squeeze(-1)
+        # Step 1: Sample DAG structure
+        adj = sample_dag_with_subgraphs(hp.n_nodes, hp.redirection_prob, hp.n_subgraphs)
         
-        return forward
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic regression dataset."""
-        # Sample input features
-        X = self._sample_features(n_samples, n_features)
+        # Step 2: Sample edge mappings
+        edge_mappings = {}
+        for i in range(hp.n_nodes):
+            parents = np.where(adj[i] > 0)[0]
+            if len(parents) > 0:
+                input_dim = len(parents) * hp.node_dim
+                edge_mappings[i] = sample_edge_mapping(input_dim, hp.node_dim)
         
-        # Sample and apply random function
-        func = self.sample_function(n_features)
-        y = func(X)
+        # Track categorical discretization nodes for potential targets
+        categorical_nodes = []
+        for i, mapping in edge_mappings.items():
+            if isinstance(mapping, CategoricalDiscretization):
+                categorical_nodes.append((i, mapping))
         
-        # Add noise
-        noise_std = random.uniform(*self.noise_std_range)
-        y += np.random.randn(n_samples) * noise_std * (y.std() + 1e-6)
+        # Step 3: Generate initialization data and propagate through DAG
+        node_values = {}  # node_id -> (n_samples, node_dim)
         
-        # Handle NaN/Inf
-        y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
-        y = np.clip(y, -1e6, 1e6)
+        # Find root nodes (no parents)
+        root_nodes = [i for i in range(hp.n_nodes) if adj[i].sum() == 0]
         
-        # Determine train/test split
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)
+        # Initialize root nodes
+        for node in root_nodes:
+            node_values[node] = sample_initialization_data(
+                hp.n_samples, hp.node_dim,
+                hp.init_type, hp.init_scale,
+                hp.prototype_fraction, hp.prototype_temperature,
+            )
         
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.float32),
-            train_size=train_size,
-            n_classes=0,
-            is_regression=True,
-        )
-    
-    def _sample_features(self, n_samples: int, n_features: int) -> np.ndarray:
-        """Sample feature values from various distributions."""
-        X = np.zeros((n_samples, n_features))
-        
-        for i in range(n_features):
-            dist_type = random.choice(['uniform', 'normal', 'mixture'])
+        # Propagate through graph (topological order ensured by DAG structure)
+        for i in range(hp.n_nodes):
+            if i in node_values:
+                continue  # Already initialized (root node)
             
-            if dist_type == 'uniform':
-                low = random.uniform(-10, 0)
-                high = random.uniform(0, 10)
-                X[:, i] = np.random.uniform(low, high, n_samples)
-            elif dist_type == 'normal':
-                mean = random.uniform(-5, 5)
-                std = random.uniform(0.1, 3)
-                X[:, i] = np.random.normal(mean, std, n_samples)
+            parents = np.where(adj[i] > 0)[0]
+            if len(parents) == 0:
+                # Root node not yet initialized
+                node_values[i] = sample_initialization_data(
+                    hp.n_samples, hp.node_dim,
+                    hp.init_type, hp.init_scale,
+                )
             else:
-                n_components = random.randint(2, 4)
-                means = np.random.uniform(-5, 5, n_components)
-                stds = np.random.uniform(0.1, 2, n_components)
-                component_idx = np.random.choice(n_components, n_samples)
-                X[:, i] = np.array([
-                    np.random.normal(means[c], stds[c])
-                    for c in component_idx
-                ])
+                # Concatenate parent values
+                parent_values = np.concatenate([node_values[p] for p in parents], axis=1)
+                
+                # Apply edge mapping
+                node_values[i] = edge_mappings[i](parent_values)
+                
+                # Add Gaussian noise
+                node_values[i] += np.random.randn(*node_values[i].shape) * hp.edge_noise_std
         
-        return X
-
-
-class GPRegressionPrior:
-    """
-    Generate regression data using Gaussian Processes.
-    
-    GPs provide smooth function samples ideal for regression.
-    """
-    
-    def __init__(
-        self,
-        lengthscale_range: Tuple[float, float] = (0.1, 2.0),
-        outputscale_range: Tuple[float, float] = (0.5, 2.0),
-        noise_std_range: Tuple[float, float] = (0.01, 0.2),
-    ):
-        self.lengthscale_range = lengthscale_range
-        self.outputscale_range = outputscale_range
-        self.noise_std_range = noise_std_range
-    
-    def _rbf_kernel(
-        self, 
-        X1: np.ndarray, 
-        X2: np.ndarray, 
-        lengthscale: float,
-        outputscale: float,
-    ) -> np.ndarray:
-        X1_sq = np.sum(X1**2, axis=1, keepdims=True)
-        X2_sq = np.sum(X2**2, axis=1, keepdims=True)
-        dist_sq = X1_sq + X2_sq.T - 2 * X1 @ X2.T
-        K = outputscale * np.exp(-0.5 * dist_sq / lengthscale**2)
-        return K
-    
-    def sample_function_values(self, X: np.ndarray) -> np.ndarray:
-        """Sample function values at given points from a GP."""
-        n_samples = X.shape[0]
+        # Step 4: Sample feature and target node positions
+        all_nodes = list(range(hp.n_nodes))
         
-        lengthscale = random.uniform(*self.lengthscale_range)
-        outputscale = random.uniform(*self.outputscale_range)
-        
-        K = self._rbf_kernel(X, X, lengthscale, outputscale)
-        K += np.eye(n_samples) * 1e-6
-        
-        try:
-            L = np.linalg.cholesky(K)
-            z = np.random.randn(n_samples)
-            f = L @ z
-        except np.linalg.LinAlgError:
-            f = np.random.randn(n_samples)
-        
-        return f
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic regression dataset."""
-        X = np.random.uniform(-3, 3, (n_samples, n_features))
-        
-        y = self.sample_function_values(X)
-        
-        # Add noise
-        noise_std = random.uniform(*self.noise_std_range)
-        y += np.random.randn(n_samples) * noise_std
-        
-        y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
-        y = np.clip(y, -1e6, 1e6)
-        
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.float32),
-            train_size=train_size,
-            n_classes=0,
-            is_regression=True,
-        )
-
-
-class LinearRegressionPrior:
-    """
-    Generate regression data using random linear functions with optional
-    polynomial features and interactions.
-    """
-    
-    def __init__(
-        self,
-        include_interactions: bool = True,
-        max_polynomial_degree: int = 3,
-        noise_std_range: Tuple[float, float] = (0.01, 0.3),
-    ):
-        self.include_interactions = include_interactions
-        self.max_polynomial_degree = max_polynomial_degree
-        self.noise_std_range = noise_std_range
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic regression dataset."""
-        X = np.random.uniform(-3, 3, (n_samples, n_features))
-        
-        # Random coefficients
-        coeffs = np.random.randn(n_features) * 2
-        
-        # Linear term
-        y = X @ coeffs
-        
-        # Add polynomial terms
-        if self.max_polynomial_degree > 1:
-            degree = random.randint(2, self.max_polynomial_degree)
-            for d in range(2, degree + 1):
-                # Select random features for polynomial
-                n_poly_features = random.randint(1, min(3, n_features))
-                poly_features = np.random.choice(n_features, n_poly_features, replace=False)
-                for f in poly_features:
-                    coeff = np.random.randn() * 0.5
-                    y += coeff * (X[:, f] ** d)
-        
-        # Add interaction terms
-        if self.include_interactions and n_features > 1:
-            n_interactions = random.randint(1, min(5, n_features * (n_features - 1) // 2))
-            for _ in range(n_interactions):
-                f1, f2 = np.random.choice(n_features, 2, replace=False)
-                coeff = np.random.randn() * 0.3
-                y += coeff * X[:, f1] * X[:, f2]
-        
-        # Add noise
-        noise_std = random.uniform(*self.noise_std_range)
-        y += np.random.randn(n_samples) * noise_std * (y.std() + 1e-6)
-        
-        y = np.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
-        y = np.clip(y, -1e6, 1e6)
-        
-        train_size = max(1, int(n_samples * train_ratio))
-        train_size = min(train_size, n_samples - 1)
-        
-        return SyntheticDataset(
-            X=X.astype(np.float32),
-            y=y.astype(np.float32),
-            train_size=train_size,
-            n_classes=0,
-            is_regression=True,
-        )
-
-
-class MixedRegressionPrior:
-    """
-    Mixture of multiple regression priors for diverse training data.
-    """
-    
-    def __init__(
-        self,
-        priors: Optional[List[Any]] = None,
-        weights: Optional[List[float]] = None,
-    ):
-        if priors is None:
-            priors = [MLPRegressionPrior(), GPRegressionPrior(), LinearRegressionPrior()]
-        if weights is None:
-            weights = [1.0] * len(priors)
-        
-        self.priors = priors
-        self.weights = np.array(weights) / sum(weights)
-    
-    def generate(
-        self,
-        n_samples: int,
-        n_features: int,
-        train_ratio: float = 0.7,
-    ) -> SyntheticDataset:
-        """Generate a synthetic regression dataset using a random prior."""
-        prior_idx = np.random.choice(len(self.priors), p=self.weights)
-        return self.priors[prior_idx].generate(n_samples, n_features, train_ratio)
-
-
-def get_prior(prior_type: str, **kwargs) -> Any:
-    """Get a prior by name.
-    
-    Note: Following TabPFN, classification and regression are trained as separate models.
-    Use 'mixed' for classification and 'mixed_regression' for regression.
-    
-    Augmented variants (e.g., 'augmented_mixed') add categorical features, 
-    missing values, and noise following TabPFN's preprocessing approach.
-    """
-    # Extract augmentation parameters
-    categorical_prob = kwargs.pop('categorical_prob', 0.3)
-    missing_prob = kwargs.pop('missing_prob', 0.1)
-    augment_prob = kwargs.pop('augment_prob', 0.7)
-    
-    priors = {
-        # Classification priors
-        'mlp': MLPPrior,
-        'gp': GPPrior,
-        'tree': TreePrior,
-        'scm': SCMPrior,
-        'mixed': MixedPrior,
-        # Regression priors
-        'mlp_regression': MLPRegressionPrior,
-        'gp_regression': GPRegressionPrior,
-        'linear_regression': LinearRegressionPrior,
-        'mixed_regression': MixedRegressionPrior,
-    }
-    
-    # Check for augmented variants
-    if prior_type.startswith('augmented_'):
-        base_type = prior_type[len('augmented_'):]
-        if base_type not in priors:
-            raise ValueError(f"Unknown base prior: {base_type}. Available: {list(priors.keys())}")
-        
-        base_prior = priors[base_type](**kwargs)
-        
-        # Check if it's a regression prior
-        if 'regression' in base_type:
-            return AugmentedRegressionPrior(
-                base_prior=base_prior,
-                categorical_prob=categorical_prob,
-                missing_prob=missing_prob,
-                augment_prob=augment_prob,
+        # For classification: prefer categorical nodes for target
+        if not self.is_regression and categorical_nodes:
+            target_node_idx, target_mapping = random.choice(categorical_nodes)
+            target_values = target_mapping.get_categories(
+                np.concatenate([node_values[p] for p in np.where(adj[target_node_idx] > 0)[0]], axis=1)
+                if adj[target_node_idx].sum() > 0 else node_values[target_node_idx]
             )
+            hp.n_classes = target_mapping.n_categories
         else:
-            return AugmentedPrior(
-                base_prior=base_prior,
-                categorical_prob=categorical_prob,
-                missing_prob=missing_prob,
-                augment_prob=augment_prob,
-            )
-    
-    if prior_type not in priors:
-        raise ValueError(f"Unknown prior: {prior_type}. Available: {list(priors.keys())} + augmented_* variants")
-    return priors[prior_type](**kwargs)
+            # Select a random node for target
+            target_node_idx = random.choice(all_nodes)
+            # Use first dimension of node values as continuous target
+            target_values = node_values[target_node_idx][:, 0]
+            
+            if not self.is_regression:
+                # Convert continuous to discrete classes
+                hp.n_classes = min(hp.n_classes, 10)
+                if hp.n_classes == 2:
+                    target_values = (target_values > np.median(target_values)).astype(np.int64)
+                else:
+                    percentiles = np.linspace(0, 100, hp.n_classes + 1)[1:-1]
+                    thresholds = np.percentile(target_values, percentiles)
+                    target_values = np.digitize(target_values, thresholds)
+        
+        # Select feature nodes (different from target)
+        available_nodes = [n for n in all_nodes if n != target_node_idx]
+        n_feature_nodes = min(hp.n_features, len(available_nodes))
+        feature_nodes = random.sample(available_nodes, n_feature_nodes)
+        
+        # Step 5: Extract feature representations
+        feature_dims_per_node = max(1, hp.n_features // n_feature_nodes)
+        features = []
+        
+        for node in feature_nodes:
+            node_data = node_values[node]
+            # Extract some dimensions from this node
+            n_dims = min(feature_dims_per_node, node_data.shape[1], hp.n_features - len(features))
+            dim_indices = random.sample(range(node_data.shape[1]), n_dims)
+            for d in dim_indices:
+                features.append(node_data[:, d])
+                if len(features) >= hp.n_features:
+                    break
+            if len(features) >= hp.n_features:
+                break
+        
+        # Pad if needed
+        while len(features) < hp.n_features:
+            # Add noise features
+            features.append(np.random.randn(hp.n_samples))
+        
+        X = np.stack(features[:hp.n_features], axis=1)
+        
+        # Paper: For regression, target should be a continuous feature WITHOUT post-processing
+        # We extract the target before applying post-processing
+        if self.is_regression:
+            # Use target_values directly (continuous, no post-processing)
+            y = target_values.astype(np.float32)
+        else:
+            y = target_values.astype(np.int64)
+            
+            # CRITICAL: Normalize labels to be consecutive 0, 1, ..., n_classes-1
+            # This is essential for cross-entropy loss to work correctly.
+            # TabPFN v1 does this in flexible_categorical.py with normalize_labels=True
+            unique_labels = np.unique(y)
+            if len(unique_labels) > 1:
+                # Create mapping from original labels to 0, 1, 2, ...
+                label_mapping = {old: new for new, old in enumerate(unique_labels)}
+                y = np.array([label_mapping[label] for label in y], dtype=np.int64)
+                hp.n_classes = len(unique_labels)
+            else:
+                # Only one class - this is a degenerate case, but handle gracefully
+                y = np.zeros_like(y, dtype=np.int64)
+                hp.n_classes = 1
+        
+        # Step 6: Apply post-processing to features (NOT to regression target)
+        X, categorical_mask, missing_mask = apply_post_processing(X, hp)
+        
+        # Handle Inf values but preserve NaN for missing values (model handles NaN)
+        X = np.where(np.isinf(X), np.sign(X) * 1e6, X)
+        X = np.clip(np.where(np.isnan(X), X, np.clip(X, -1e6, 1e6)), -1e6, 1e6)
+        
+        # Compute train size
+        train_size = max(1, int(hp.n_samples * train_ratio))
+        train_size = min(train_size, hp.n_samples - 1)
+        
+        return SyntheticDataset(
+            X=X.astype(np.float32),
+            y=y,
+            train_size=train_size,
+            n_classes=0 if self.is_regression else hp.n_classes,
+            is_regression=self.is_regression,
+            categorical_mask=categorical_mask,
+            missing_mask=missing_mask,
+        )
 
 
-class SyntheticDataGenerator:
+# ============================================================================
+# Dataset Batch Generator and Storage
+# ============================================================================
+
+def _generate_single_dataset_worker(args: Tuple) -> Dict:
     """
-    Generate and save synthetic datasets for training.
+    Worker function for parallel dataset generation.
+    Must be a top-level function for multiprocessing to work.
     
-    Generates batches of synthetic datasets and saves them to HDF5 format
-    for efficient loading during training.
+    Args:
+        args: Tuple of (worker_id, seed, generator_params, max_samples, max_features)
+    
+    Returns:
+        Dictionary with dataset arrays
+    """
+    worker_id, seed, generator_params, max_samples, max_features = args
+    
+    # Set unique seed for this worker
+    worker_seed = seed + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    
+    # Create generator with params
+    generator = SCMDataGenerator(
+        n_samples_range=generator_params['n_samples_range'],
+        n_features_range=generator_params['n_features_range'],
+        n_classes_range=generator_params['n_classes_range'],
+        is_regression=generator_params['is_regression'],
+    )
+    
+    # Generate dataset
+    train_ratio = random.uniform(*generator_params['train_ratio_range'])
+    dataset = generator.generate(train_ratio=train_ratio)
+    
+    n_samples = min(dataset.X.shape[0], max_samples)
+    n_features = min(dataset.X.shape[1], max_features)
+    
+    # Prepare result arrays (padded to max sizes)
+    X = np.zeros((max_samples, max_features), dtype=np.float32)
+    y = np.zeros(max_samples, dtype=np.float32)
+    categorical_mask = np.zeros(max_features, dtype=bool)
+    missing_mask = np.zeros((max_samples, max_features), dtype=bool)
+    
+    X[:n_samples, :n_features] = dataset.X[:n_samples, :n_features]
+    y[:n_samples] = dataset.y[:n_samples]
+    
+    if dataset.categorical_mask is not None:
+        categorical_mask[:n_features] = dataset.categorical_mask[:n_features]
+    if dataset.missing_mask is not None:
+        missing_mask[:n_samples, :n_features] = dataset.missing_mask[:n_samples, :n_features]
+    
+    return {
+        'X': X,
+        'y': y,
+        'train_size': min(dataset.train_size, n_samples - 1),
+        'n_features': n_features,
+        'n_samples': n_samples,
+        'categorical_mask': categorical_mask,
+        'missing_mask': missing_mask,
+    }
+
+
+def _generate_batch_parallel(
+    batch_size: int,
+    generator_params: Dict,
+    max_samples: int,
+    max_features: int,
+    n_workers: int,
+    base_seed: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Generate a batch of datasets in parallel using multiprocessing.
+    
+    Args:
+        batch_size: Number of datasets to generate
+        generator_params: Parameters for the SCMDataGenerator
+        max_samples: Maximum samples per dataset
+        max_features: Maximum features per dataset
+        n_workers: Number of parallel workers
+        base_seed: Base random seed (each worker gets base_seed + worker_id)
+    
+    Returns:
+        Dictionary with batched arrays
+    """
+    # Prepare arguments for each worker
+    args_list = [
+        (i, base_seed, generator_params, max_samples, max_features)
+        for i in range(batch_size)
+    ]
+    
+    # Use multiprocessing pool
+    with mp.Pool(processes=n_workers) as pool:
+        results = pool.map(_generate_single_dataset_worker, args_list)
+    
+    # Aggregate results
+    X_batch = np.stack([r['X'] for r in results], axis=0)
+    y_batch = np.stack([r['y'] for r in results], axis=0)
+    train_sizes = np.array([r['train_size'] for r in results], dtype=np.int32)
+    n_features_list = np.array([r['n_features'] for r in results], dtype=np.int32)
+    n_samples_list = np.array([r['n_samples'] for r in results], dtype=np.int32)
+    categorical_masks = np.stack([r['categorical_mask'] for r in results], axis=0)
+    missing_masks = np.stack([r['missing_mask'] for r in results], axis=0)
+    
+    return {
+        'X': X_batch,
+        'y': y_batch,
+        'train_size': train_sizes,
+        'n_features': n_features_list,
+        'n_samples': n_samples_list,
+        'categorical_mask': categorical_masks,
+        'missing_mask': missing_masks,
+    }
+
+
+class SyntheticDatasetGenerator:
+    """
+    Generate and save batches of synthetic datasets for training.
+    Supports parallel generation using multiple CPU cores.
     """
     
     def __init__(
         self,
-        prior: Any,
         n_samples_range: Tuple[int, int] = (10, 100),
         n_features_range: Tuple[int, int] = (2, 20),
         n_classes_range: Tuple[int, int] = (2, 10),
         train_ratio_range: Tuple[float, float] = (0.5, 0.9),
+        is_regression: bool = False,
+        n_workers: int = None,
     ):
-        self.prior = prior
         self.n_samples_range = n_samples_range
         self.n_features_range = n_features_range
         self.n_classes_range = n_classes_range
         self.train_ratio_range = train_ratio_range
+        self.is_regression = is_regression
+        
+        # Set number of workers (default to number of CPU cores)
+        if n_workers is None:
+            self.n_workers = mp.cpu_count()
+        else:
+            self.n_workers = max(1, n_workers)
+        
+        # Keep a local generator for non-parallel use
+        self.generator = SCMDataGenerator(
+            n_samples_range=n_samples_range,
+            n_features_range=n_features_range,
+            n_classes_range=n_classes_range,
+            is_regression=is_regression,
+        )
+        
+        # Parameters dict for passing to workers
+        self._generator_params = {
+            'n_samples_range': n_samples_range,
+            'n_features_range': n_features_range,
+            'n_classes_range': n_classes_range,
+            'train_ratio_range': train_ratio_range,
+            'is_regression': is_regression,
+        }
     
     def generate_batch(
         self,
@@ -1221,8 +981,19 @@ class SyntheticDataGenerator:
         max_samples: int,
         max_features: int,
         max_classes: int,
+        parallel: bool = True,
+        base_seed: int = None,
     ) -> Dict[str, np.ndarray]:
-        """Generate a batch of synthetic datasets.
+        """
+        Generate a batch of synthetic datasets.
+        
+        Args:
+            batch_size: Number of datasets to generate
+            max_samples: Maximum samples per dataset
+            max_features: Maximum features per dataset
+            max_classes: Maximum number of classes
+            parallel: Whether to use parallel generation (default: True)
+            base_seed: Base random seed for reproducibility
         
         Returns:
             Dictionary with:
@@ -1231,32 +1002,52 @@ class SyntheticDataGenerator:
             - train_size: (batch,) train/test split positions
             - n_features: (batch,) actual number of features
             - n_samples: (batch,) actual number of samples
+            - categorical_mask: (batch, max_features) categorical feature indicators
+            - missing_mask: (batch, max_samples, max_features) missing value indicators
         """
+        if base_seed is None:
+            base_seed = random.randint(0, 2**31 - 1)
+        
+        # Use parallel generation if enabled and batch is large enough
+        if parallel and self.n_workers > 1 and batch_size >= self.n_workers:
+            return _generate_batch_parallel(
+                batch_size=batch_size,
+                generator_params=self._generator_params,
+                max_samples=max_samples,
+                max_features=max_features,
+                n_workers=self.n_workers,
+                base_seed=base_seed,
+            )
+        
+        # Fall back to sequential generation
         X_batch = np.zeros((batch_size, max_samples, max_features), dtype=np.float32)
         y_batch = np.zeros((batch_size, max_samples), dtype=np.float32)
         train_sizes = np.zeros(batch_size, dtype=np.int32)
         n_features_list = np.zeros(batch_size, dtype=np.int32)
         n_samples_list = np.zeros(batch_size, dtype=np.int32)
+        categorical_masks = np.zeros((batch_size, max_features), dtype=bool)
+        missing_masks = np.zeros((batch_size, max_samples, max_features), dtype=bool)
         
         for i in range(batch_size):
-            # Sample dataset parameters
-            n_samples = random.randint(*self.n_samples_range)
-            n_samples = min(n_samples, max_samples)
-            n_features = random.randint(*self.n_features_range)
-            n_features = min(n_features, max_features)
-            n_classes = random.randint(*self.n_classes_range)
-            n_classes = min(n_classes, max_classes)
             train_ratio = random.uniform(*self.train_ratio_range)
             
             # Generate dataset
-            dataset = self.prior.generate(n_samples, n_features, n_classes, train_ratio)
+            dataset = self.generator.generate(train_ratio=train_ratio)
+            
+            n_samples = min(dataset.X.shape[0], max_samples)
+            n_features = min(dataset.X.shape[1], max_features)
             
             # Store in batch arrays (with padding)
-            X_batch[i, :n_samples, :n_features] = dataset.X
-            y_batch[i, :n_samples] = dataset.y
-            train_sizes[i] = dataset.train_size
+            X_batch[i, :n_samples, :n_features] = dataset.X[:n_samples, :n_features]
+            y_batch[i, :n_samples] = dataset.y[:n_samples]
+            train_sizes[i] = min(dataset.train_size, n_samples - 1)
             n_features_list[i] = n_features
             n_samples_list[i] = n_samples
+            
+            if dataset.categorical_mask is not None:
+                categorical_masks[i, :n_features] = dataset.categorical_mask[:n_features]
+            if dataset.missing_mask is not None:
+                missing_masks[i, :n_samples, :n_features] = dataset.missing_mask[:n_samples, :n_features]
         
         return {
             'X': X_batch,
@@ -1264,6 +1055,8 @@ class SyntheticDataGenerator:
             'train_size': train_sizes,
             'n_features': n_features_list,
             'n_samples': n_samples_list,
+            'categorical_mask': categorical_masks,
+            'missing_mask': missing_masks,
         }
     
     def generate_and_save(
@@ -1274,47 +1067,73 @@ class SyntheticDataGenerator:
         max_samples: int = 100,
         max_features: int = 20,
         max_classes: int = 10,
+        parallel: bool = True,
     ):
-        """Generate datasets and save to HDF5 file."""
+        """
+        Generate datasets and save to HDF5 file.
+        
+        Args:
+            output_path: Path to output HDF5 file
+            n_datasets: Total number of datasets to generate
+            batch_size: Number of datasets per batch
+            max_samples: Maximum samples per dataset
+            max_features: Maximum features per dataset
+            max_classes: Maximum number of classes
+            parallel: Whether to use parallel generation (default: True)
+        """
         n_batches = (n_datasets + batch_size - 1) // batch_size
+        
+        if parallel and self.n_workers > 1:
+            print(f"Using {self.n_workers} parallel workers for data generation")
         
         with h5py.File(output_path, 'w') as f:
             # Create datasets with chunked storage
             f.create_dataset('X', shape=(0, max_samples, max_features),
                            maxshape=(None, max_samples, max_features),
-                           chunks=(batch_size, max_samples, max_features),
+                           chunks=(min(batch_size, 100), max_samples, max_features),
                            dtype='float32', compression='lzf')
             f.create_dataset('y', shape=(0, max_samples),
                            maxshape=(None, max_samples),
-                           chunks=(batch_size, max_samples),
+                           chunks=(min(batch_size, 100), max_samples),
                            dtype='float32')
             f.create_dataset('single_eval_pos', shape=(0,),
-                           maxshape=(None,), chunks=(batch_size,), dtype='int32')
+                           maxshape=(None,), chunks=(min(batch_size, 100),), dtype='int32')
             f.create_dataset('num_features', shape=(0,),
-                           maxshape=(None,), chunks=(batch_size,), dtype='int32')
+                           maxshape=(None,), chunks=(min(batch_size, 100),), dtype='int32')
             f.create_dataset('num_datapoints', shape=(0,),
-                           maxshape=(None,), chunks=(batch_size,), dtype='int32')
+                           maxshape=(None,), chunks=(min(batch_size, 100),), dtype='int32')
+            f.create_dataset('categorical_mask', shape=(0, max_features),
+                           maxshape=(None, max_features),
+                           chunks=(min(batch_size, 100), max_features), dtype='bool')
+            f.create_dataset('missing_mask', shape=(0, max_samples, max_features),
+                           maxshape=(None, max_samples, max_features),
+                           chunks=(min(batch_size, 100), max_samples, max_features), dtype='bool')
             
             # Metadata
             f.create_dataset('max_num_classes', data=np.array([max_classes]))
-            f.create_dataset('problem_type', data='classification')
+            f.create_dataset('problem_type', data='regression' if self.is_regression else 'classification')
             
             # Generate batches
             total_generated = 0
+            base_seed = random.randint(0, 2**31 - 1)
             pbar = tqdm(range(n_batches), desc="Generating datasets")
             
-            for _ in pbar:
+            for batch_idx in pbar:
                 current_batch_size = min(batch_size, n_datasets - total_generated)
                 if current_batch_size <= 0:
                     break
                 
+                # Use different seed for each batch to ensure reproducibility
+                batch_seed = base_seed + batch_idx * batch_size
+                
                 batch = self.generate_batch(
-                    current_batch_size, max_samples, max_features, max_classes
+                    current_batch_size, max_samples, max_features, max_classes,
+                    parallel=parallel, base_seed=batch_seed
                 )
                 
                 # Append to HDF5
                 n = f['X'].shape[0]
-                for key in ['X', 'y']:
+                for key in ['X', 'y', 'categorical_mask', 'missing_mask']:
                     f[key].resize(n + current_batch_size, axis=0)
                     f[key][n:n+current_batch_size] = batch[key]
                 
@@ -1333,19 +1152,30 @@ class SyntheticDataGenerator:
         print(f"Generated {total_generated} datasets, saved to {output_path}")
 
 
-def visualize_prior(prior, n_samples: int = 200, n_features: int = 2, n_classes: int = 2):
-    """Visualize samples from a prior (requires matplotlib)."""
+# ============================================================================
+# Visualization
+# ============================================================================
+
+def visualize_datasets(n_datasets: int = 6, n_samples: int = 200, n_features: int = 2):
+    """Visualize samples from the SCM generator (requires matplotlib)."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib required for visualization")
         return
     
+    generator = SCMDataGenerator(
+        n_samples_range=(n_samples, n_samples),
+        n_features_range=(n_features, n_features),
+        n_classes_range=(2, 5),
+    )
+    
     fig, axes = plt.subplots(2, 3, figsize=(12, 8))
     
     for i, ax in enumerate(axes.flat):
-        dataset = prior.generate(n_samples, n_features, n_classes)
+        dataset = generator.generate()
         
+        n_classes = dataset.n_classes
         if n_features >= 2:
             for c in range(n_classes):
                 mask = dataset.y == c
@@ -1357,18 +1187,24 @@ def visualize_prior(prior, n_samples: int = 200, n_features: int = 2, n_classes:
                 ax.scatter(dataset.X[mask, 0], np.zeros_like(dataset.X[mask, 0]) + c*0.1,
                           alpha=0.6, label=f'Class {c}', s=20)
         
-        ax.set_title(f'Sample {i+1}')
+        ax.set_title(f'Dataset {i+1} ({n_classes} classes)')
         ax.legend(fontsize=8)
     
-    plt.suptitle(f'{prior.__class__.__name__} Samples', fontsize=14)
+    plt.suptitle('SCM-Based Synthetic Datasets', fontsize=14)
     plt.tight_layout()
-    plt.savefig('prior_samples.png', dpi=150)
+    plt.savefig('scm_samples.png', dpi=150)
     plt.show()
-    print("Saved visualization to prior_samples.png")
+    print("Saved visualization to scm_samples.png")
 
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate synthetic data for training')
+    parser = argparse.ArgumentParser(
+        description='Generate synthetic tabular data for TabPFN training using SCMs'
+    )
     
     parser.add_argument('--output', '-o', type=str, default='data/synthetic.h5',
                        help='Output HDF5 file path')
@@ -1376,18 +1212,22 @@ def main():
                        help='Number of datasets to generate')
     parser.add_argument('--batch_size', type=int, default=1000,
                        help='Batch size for generation')
-    parser.add_argument('--max_samples', type=int, default=100,
-                       help='Maximum samples per dataset')
-    parser.add_argument('--max_features', type=int, default=20,
-                       help='Maximum features per dataset')
+    parser.add_argument('--max_samples', type=int, default=512,
+                       help='Maximum samples per dataset (paper uses up to 2048)')
+    parser.add_argument('--max_features', type=int, default=160,
+                       help='Maximum features per dataset (paper uses Beta distribution scaled to 1-160)')
     parser.add_argument('--max_classes', type=int, default=10,
                        help='Maximum number of classes')
-    parser.add_argument('--prior', type=str, default='mixed',
-                       help='Prior type to use (base: mlp, gp, tree, scm, mixed; augmented: augmented_*; regression: *_regression)')
+    parser.add_argument('--regression', action='store_true',
+                       help='Generate regression datasets instead of classification')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--workers', '-w', type=int, default=None,
+                       help='Number of parallel workers (default: all CPU cores)')
+    parser.add_argument('--no-parallel', action='store_true',
+                       help='Disable parallel generation')
     parser.add_argument('--visualize', action='store_true',
-                       help='Visualize prior samples instead of generating data')
+                       help='Visualize sample datasets instead of generating data')
     
     args = parser.parse_args()
     
@@ -1395,18 +1235,21 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     
-    # Get prior
-    prior = get_prior(args.prior)
-    
     if args.visualize:
-        visualize_prior(prior)
+        visualize_datasets()
         return
     
     # Generate data
-    import os
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     
-    generator = SyntheticDataGenerator(prior)
+    generator = SyntheticDatasetGenerator(
+        n_samples_range=(32, args.max_samples),
+        n_features_range=(2, args.max_features),
+        n_classes_range=(2, args.max_classes),
+        is_regression=args.regression,
+        n_workers=args.workers,
+    )
+    
     generator.generate_and_save(
         output_path=args.output,
         n_datasets=args.n_datasets,
@@ -1414,8 +1257,57 @@ def main():
         max_samples=args.max_samples,
         max_features=args.max_features,
         max_classes=args.max_classes,
+        parallel=not args.no_parallel,
     )
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    
+    # If no arguments provided, run tests
+    if len(sys.argv) == 1:
+        print("Testing SyntheticDatasetGenerator...")
+        
+        # Set seeds for reproducibility
+        random.seed(42)
+        np.random.seed(42)
+        
+        # Create generator
+        generator = SyntheticDatasetGenerator(
+            n_samples_range=(20, 50),
+            n_features_range=(5, 10),
+            n_classes_range=(2, 5),
+        )
+        
+        # Test hyperparameter sampling
+        params = sample_hyperparameters(
+            n_samples_range=(20, 50),
+            n_features_range=(5, 10),
+            n_classes_range=(2, 5),
+        )
+        print(f"Sampled hyperparameters: n_nodes={params.n_nodes}, n_features={params.n_features}, "
+              f"n_samples={params.n_samples}, n_classes={params.n_classes}")
+        
+        # Test single dataset generation (using internal SCMDataGenerator)
+        print("\nGenerating single dataset...")
+        dataset = generator.generator.generate()
+        print(f"  X shape: {dataset.X.shape}")
+        print(f"  y shape: {dataset.y.shape}")
+        print(f"  train_size: {dataset.train_size}")
+        print(f"  n_classes: {dataset.n_classes}")
+        print(f"  y unique values: {np.unique(dataset.y)}")
+        
+        # Test batch generation
+        print("\nGenerating batch of 5 datasets...")
+        batch = generator.generate_batch(5, max_samples=50, max_features=10, max_classes=5)
+        print(f"  X batch shape: {batch['X'].shape}")
+        print(f"  y batch shape: {batch['y'].shape}")
+        print(f"  train_sizes: {batch['train_size']}")
+        print(f"  n_classes: {batch['n_features']}")
+        # Verify data is valid
+        assert not np.isnan(batch['X']).all(), "X contains all NaN values"
+        assert batch['X'].shape[0] == 5, "Batch size mismatch"
+        
+        print("\n✓ Data generation test passed!")
+    else:
+        main()
