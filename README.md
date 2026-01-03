@@ -14,6 +14,13 @@ uv sync
 # Install TabArena for benchmarking (optional)
 uv pip install "tabarena @ git+https://github.com/autogluon/tabarena.git#subdirectory=tabarena"
 
+#Typical chain of executions to run a basic data generation + training + eval
+python generate_data.py --n_datasets 1000000 --output data/synthetic.h5 --max_features 50
+python train.py --data data/synthetic.h5 --steps 15500  --batch_size 4 --gradient_accumulation_steps 16 --n_layers 3 --log_interval 1 --eval_interval 20 --save_interval 500 --max_features 50 --embedding_size 96 --n_heads 4 --mlp_hidden 192
+python evaluate.py --checkpoint checkpoints/final_model.pt --mode lite
+python evaluate.py --mode leaderboard --results eval_results --method OpenTab
+
+
 # Train classification model (online data generation)
 python train.py --online --steps 100000 --output_dir checkpoints
 
