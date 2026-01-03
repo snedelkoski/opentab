@@ -356,8 +356,6 @@ class Trainer:
             test_logits = logits[0, :ns - ts]
             test_targets = y[i, ts:ns]
             
-            print(test_logits.shape, test_targets.shape)  # --- IGNORE ---
-
             if self.config.is_regression:
                 # For regression, use cross-entropy over bins
                 loss = F.cross_entropy(test_logits, test_targets.long())
