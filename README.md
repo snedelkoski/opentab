@@ -300,6 +300,13 @@ Results on [TabArena](https://github.com/autogluon/tabarena) benchmark comparing
   year={2023}
 }
 
+@article{pfefferle2025nanotabpfn,
+  title={nanoTabPFN: A Lightweight and Educational Reimplementation of TabPFN},
+  author={Pfefferle, Alexander and Hog, Johannes and Purucker, Lennart and Hutter, Frank},
+  journal={arXiv preprint arXiv:2511.03634},
+  year={2025}
+}
+
 @article{erickson2025tabarena,
   title={TabArena: A Living Benchmark for Machine Learning on Tabular Data}, 
   author={Nick Erickson and Lennart Purucker and others},
