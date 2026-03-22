@@ -57,6 +57,12 @@ class OpenTabEncoder(nn.Module):
         # Learned projection for random feature embeddings
         self.feature_embedding_proj = nn.Linear(random_feature_dim, embedding_dim)
         
+        # Pre-generate deterministic random feature vectors (fixed across forward passes)
+        rng = torch.Generator()
+        rng.manual_seed(42)
+        random_vectors = torch.randn(max_features, random_feature_dim, generator=rng)
+        self.register_buffer('random_feature_vectors', random_vectors)
+        
         # Target encoder (for training labels)
         self.target_encoder = nn.Linear(1, embedding_dim)
     
@@ -113,13 +119,8 @@ class OpenTabEncoder(nn.Module):
         # Shape: (batch, n_samples, n_features, embedding_dim)
         
         # Add random feature embeddings (same for all samples of a feature)
-        # Generate deterministic random vectors based on feature index
-        random_vectors = torch.randn(
-            n_features, self.random_feature_dim, 
-            device=device, dtype=X.dtype
-        )
-        # Make it deterministic by using a seed based on n_features
-        # In practice, we just use random vectors that are fixed per forward pass
+        # Use pre-generated deterministic vectors from the registered buffer
+        random_vectors = self.random_feature_vectors[:n_features].to(dtype=X.dtype)
         
         feature_emb_addition = self.feature_embedding_proj(random_vectors)
         # Shape: (n_features, embedding_dim)
