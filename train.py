@@ -22,7 +22,6 @@ Usage:
 
 import argparse
 import json
-import math
 import os
 import random
 import time
@@ -327,16 +326,10 @@ class Trainer:
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
     def _create_scheduler(self):
-        """Linear warmup + cosine annealing."""
+        """Constant LR (no warmup) for fast convergence in short runs."""
 
         def lr_lambda(step):
-            if step < self.config.warmup_steps:
-                return step / self.config.warmup_steps
-
-            progress = (step - self.config.warmup_steps) / (
-                self.config.n_steps - self.config.warmup_steps
-            )
-            return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
+            return 1.0
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
