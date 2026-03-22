@@ -393,7 +393,9 @@ class Trainer:
                 n_cls = int(test_targets.max().item()) + 1
                 # Ensure train labels are also covered
                 n_cls = max(n_cls, int(y_train_i.max().item()) + 1)
-                loss = F.cross_entropy(test_logits[:, :n_cls], test_targets)
+                loss = F.cross_entropy(
+                    test_logits[:, :n_cls], test_targets, label_smoothing=0.1
+                )
 
             if not torch.isnan(loss):
                 losses.append(loss)
