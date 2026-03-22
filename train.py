@@ -161,11 +161,21 @@ class OnlineDataGenerator(IterableDataset):
             train_size = max(10, train_size)
             n_samples = train_size + self.config.eval_samples
 
+            # Sample n_classes with bias toward fewer classes (2-3)
+            # which better matches typical eval datasets
+            if not self.config.is_regression:
+                population = list(range(2, self.config.max_classes + 1))
+                weights = [3, 3] + [1] * (len(population) - 2)
+                n_classes = random.choices(population, weights=weights)[0]
+            else:
+                n_classes = None
+
             # Generate dataset
             try:
                 dataset = self.generator.generate(
                     n_samples=n_samples,
                     n_features=n_features,
+                    n_classes=n_classes,
                     train_ratio=train_size / n_samples,
                 )
             except Exception:
