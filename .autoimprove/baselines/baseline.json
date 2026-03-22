@@ -1,0 +1,23 @@
+{
+  "composite_score": 0.44191,
+  "elapsed_seconds": 246.5,
+  "evaluators": [
+    {
+      "name": "train_and_eval",
+      "score": 0.44191,
+      "details": {
+        "mean_accuracy": 0.44191,
+        "per_dataset": {
+          "Iris": 0.3111,
+          "Wine": 0.3889,
+          "Breast Cancer": 0.6257
+        },
+        "training_steps": 1350,
+        "final_loss": 1.2167,
+        "elapsed_seconds": 243.9,
+        "device": "cuda"
+      },
+      "weight": 4.0
+    }
+  ]
+}

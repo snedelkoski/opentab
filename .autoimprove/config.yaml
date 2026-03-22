@@ -1,0 +1,35 @@
+version: "1.0"
+repo: opentab
+summary: "Minimal TabPFN-style Prior-Data Fitted Network for tabular data using in-context learning"
+experiment_duration_seconds: 300
+
+tech_stack:
+  language: "python"
+  framework: "pytorch"
+  package_manager: "uv"
+  test_command: "uv run pytest tests/"
+  build_command: "none"
+
+editable_files:
+  - "model.py        # Transformer architecture, encoder, dual attention, decoder, sklearn wrappers"
+  - "train.py        # Training loop, data loading, optimizer, loss computation, evaluation"
+  - "generate_data.py # SCM-based synthetic tabular data generation pipeline"
+  - "evaluate.py     # Evaluation scripts and TabArena wrappers"
+
+protected_paths:
+  - "tests/"
+  - ".autoimprove/"
+  - "pyproject.toml"
+  - "uv.lock"
+  - "__init__.py"
+  - ".gitignore"
+
+primary_metric:
+  name: "train_and_eval"
+  description: "Train for 240s then measure mean classification accuracy on Iris, Wine, and Breast Cancer"
+
+evaluators:
+  - name: "train_and_eval"
+    description: "Train model for 240s, evaluate classification accuracy on 3 sklearn datasets"
+    weight: 4.0
+    timeout: 300
