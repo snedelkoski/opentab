@@ -155,14 +155,15 @@ class InterFeatureAttention(nn.Module):
     Attention across features within each sample (row-wise).
     
     This is fully connected attention - each feature can attend to all others.
+    Uses pre-norm: LayerNorm before attention, residual after.
     """
     
     def __init__(self, embedding_dim: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
+        self.norm = nn.LayerNorm(embedding_dim)
         self.attn = nn.MultiheadAttention(
             embedding_dim, n_heads, dropout=dropout, batch_first=True
         )
-        self.norm = nn.LayerNorm(embedding_dim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -173,16 +174,18 @@ class InterFeatureAttention(nn.Module):
         """
         batch_size, n_samples, n_features, embedding_dim = x.shape
         
+        # Pre-norm
+        x_normed = self.norm(x)
+        
         # Reshape for attention: (batch * n_samples, n_features, embedding_dim)
-        x_flat = x.reshape(batch_size * n_samples, n_features, embedding_dim)
+        x_flat = x_normed.reshape(batch_size * n_samples, n_features, embedding_dim)
         
         # Self-attention across features
         attn_out, _ = self.attn(x_flat, x_flat, x_flat)
-        x_flat = x_flat + attn_out
         
-        # Reshape back and normalize
-        x = x_flat.reshape(batch_size, n_samples, n_features, embedding_dim)
-        x = self.norm(x)
+        # Reshape back and add residual
+        attn_out = attn_out.reshape(batch_size, n_samples, n_features, embedding_dim)
+        x = x + attn_out
         
         return x
 
@@ -195,15 +198,15 @@ class InterSampleAttention(nn.Module):
     - Training samples attend to all training samples
     - Test samples attend ONLY to training samples (not to each other)
     
-    This ensures test samples don't influence each other during prediction.
+    Uses pre-norm: LayerNorm before attention, residual after.
     """
     
     def __init__(self, embedding_dim: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
+        self.norm = nn.LayerNorm(embedding_dim)
         self.attn = nn.MultiheadAttention(
             embedding_dim, n_heads, dropout=dropout, batch_first=True
         )
-        self.norm = nn.LayerNorm(embedding_dim)
     
     def forward(self, x: torch.Tensor, train_size: int) -> torch.Tensor:
         """
@@ -215,11 +218,14 @@ class InterSampleAttention(nn.Module):
         """
         batch_size, n_samples, n_features, embedding_dim = x.shape
         
+        # Pre-norm
+        x_normed = self.norm(x)
+        
         # Transpose to (batch, n_features, n_samples, embedding_dim)
-        x = x.transpose(1, 2)
+        x_t = x_normed.transpose(1, 2)
         
         # Reshape for attention: (batch * n_features, n_samples, embedding_dim)
-        x_flat = x.reshape(batch_size * n_features, n_samples, embedding_dim)
+        x_flat = x_t.reshape(batch_size * n_features, n_samples, embedding_dim)
         
         # Split into train and test
         x_train = x_flat[:, :train_size, :]  # (B*F, train_size, D)
@@ -235,12 +241,12 @@ class InterSampleAttention(nn.Module):
         else:
             attn_out = train_attn
         
-        x_flat = x_flat + attn_out
-        
         # Reshape and transpose back
-        x = x_flat.reshape(batch_size, n_features, n_samples, embedding_dim)
-        x = x.transpose(2, 1)  # (batch, n_samples, n_features, embedding_dim)
-        x = self.norm(x)
+        attn_out = attn_out.reshape(batch_size, n_features, n_samples, embedding_dim)
+        attn_out = attn_out.transpose(2, 1)  # (batch, n_samples, n_features, embedding_dim)
+        
+        # Add residual
+        x = x + attn_out
         
         return x
 
@@ -249,11 +255,10 @@ class OpenTabLayer(nn.Module):
     """
     Single transformer layer with two-way attention + MLP.
     
-    Following the paper:
-    1. Inter-feature attention (column-wise within each row)
-    2. Inter-sample attention (row-wise within each column, with masking)
-    3. MLP sublayer
-    Each sublayer followed by residual addition and layer norm.
+    Uses pre-norm architecture:
+    1. Pre-norm + Inter-feature attention + residual
+    2. Pre-norm + Inter-sample attention + residual
+    3. Pre-norm + MLP + residual
     """
     
     def __init__(
@@ -268,6 +273,7 @@ class OpenTabLayer(nn.Module):
         self.feature_attn = InterFeatureAttention(embedding_dim, n_heads, dropout)
         self.sample_attn = InterSampleAttention(embedding_dim, n_heads, dropout)
         
+        self.mlp_norm = nn.LayerNorm(embedding_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embedding_dim, mlp_dim),
             nn.GELU(),
@@ -275,7 +281,6 @@ class OpenTabLayer(nn.Module):
             nn.Linear(mlp_dim, embedding_dim),
             nn.Dropout(dropout),
         )
-        self.mlp_norm = nn.LayerNorm(embedding_dim)
     
     def forward(self, x: torch.Tensor, train_size: int) -> torch.Tensor:
         """
@@ -285,15 +290,14 @@ class OpenTabLayer(nn.Module):
         Returns:
             (batch, n_samples, n_features, embedding_dim)
         """
-        # Inter-feature attention
+        # Inter-feature attention (pre-norm inside the module)
         x = self.feature_attn(x)
         
-        # Inter-sample attention
+        # Inter-sample attention (pre-norm inside the module)
         x = self.sample_attn(x, train_size)
         
-        # MLP
-        x = x + self.mlp(x)
-        x = self.mlp_norm(x)
+        # MLP with pre-norm
+        x = x + self.mlp(self.mlp_norm(x))
         
         return x
 
@@ -370,6 +374,9 @@ class OpenTabModel(nn.Module):
             for _ in range(n_layers)
         ])
         
+        # Final layer norm (required for pre-norm architecture)
+        self.final_norm = nn.LayerNorm(embedding_size)
+        
         # Decoder
         self.decoder = OpenTabDecoder(embedding_size, mlp_hidden_size, n_outputs)
     
@@ -399,6 +406,9 @@ class OpenTabModel(nn.Module):
         # Apply transformer layers
         for layer in self.layers:
             embeddings = layer(embeddings, train_size)
+        
+        # Final norm (pre-norm architecture requires this)
+        embeddings = self.final_norm(embeddings)
         
         # Extract test sample embeddings from target column (last column)
         test_embeddings = embeddings[:, train_size:, -1, :]
