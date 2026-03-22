@@ -408,8 +408,10 @@ class OpenTabModel(nn.Module):
         # Final norm (pre-norm architecture requires this)
         embeddings = self.final_norm(embeddings)
 
-        # Extract test sample embeddings from target column (last column)
-        test_embeddings = embeddings[:, train_size:, -1, :]
+        # Extract test sample embeddings: mean across all feature columns
+        # This aggregates information from all features, not just the target column,
+        # giving the decoder richer per-sample representations.
+        test_embeddings = embeddings[:, train_size:, :, :].mean(dim=2)
         # Shape: (batch, n_test, embedding_dim)
 
         # Decode to predictions
