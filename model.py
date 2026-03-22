@@ -130,10 +130,12 @@ class OpenTabEncoder(nn.Module):
         feature_embeddings = feature_embeddings + feature_emb_addition.unsqueeze(0).unsqueeze(1)
 
         # Encode targets
-        # Pad test positions with mean of training targets
+        # Use 0 for test positions (neutral value) to avoid biasing predictions
+        # toward the mean class label. The training positions carry real labels.
         y_train_float = y_train.float()
-        y_mean = y_train_float.mean(dim=1, keepdim=True)
-        y_padded = torch.cat([y_train_float, y_mean.expand(-1, n_samples - train_size)], dim=1)
+        y_padded = torch.cat(
+            [y_train_float, torch.zeros(batch_size, n_samples - train_size, device=device)], dim=1
+        )
         # Shape: (batch, n_samples)
 
         target_embeddings = self.target_encoder(y_padded.unsqueeze(-1))

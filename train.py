@@ -177,6 +177,10 @@ class OnlineDataGenerator(IterableDataset):
                 y = torch.tensor(dataset.y, dtype=torch.float32)
             else:
                 y = torch.tensor(dataset.y, dtype=torch.long)
+                # Clamp test labels to training class range to avoid
+                # out-of-range targets in cross-entropy loss
+                n_cls = int(y[:train_size].max().item()) + 1
+                y[train_size:] = y[train_size:].clamp(0, n_cls - 1)
 
             yield {
                 "X": X,
@@ -336,6 +340,7 @@ class Trainer:
         y = batch["y"].to(self.device)
         train_sizes = batch["train_size"]
         n_samples = batch["n_samples"]
+        n_features = batch["n_features"]
 
         batch_size = X.shape[0]
         losses = []
@@ -343,12 +348,14 @@ class Trainer:
         for i in range(batch_size):
             ts = train_sizes[i].item()
             ns = n_samples[i].item()
+            nf = n_features[i].item()
 
             if ts >= ns:
                 continue  # No test samples
 
-            # Get single item
-            X_i = X[i : i + 1, :ns]
+            # Get single item, truncating to actual features to avoid
+            # polluting normalization and attention with zero-padded columns
+            X_i = X[i : i + 1, :ns, :nf]
             y_train_i = y[i : i + 1, :ts]
 
             # Skip if data is invalid
@@ -369,10 +376,14 @@ class Trainer:
                 # For regression, use cross-entropy over bins
                 loss = F.cross_entropy(test_logits, test_targets.long())
             else:
-                # Following original TabPFN/OpenTab: compute CE over all logits
-                # Labels are normalized to 0, 1, ..., n_classes-1 in generate_data.py
-                # so CE will work correctly without truncation
-                loss = F.cross_entropy(test_logits, test_targets)
+                # Truncate logits to the actual number of classes present.
+                # Training with all max_classes logits in the softmax
+                # denominator dilutes gradients; at eval logits are also
+                # truncated to n_classes.
+                n_cls = int(test_targets.max().item()) + 1
+                # Ensure train labels are also covered
+                n_cls = max(n_cls, int(y_train_i.max().item()) + 1)
+                loss = F.cross_entropy(test_logits[:, :n_cls], test_targets)
 
             if not torch.isnan(loss):
                 losses.append(loss)
