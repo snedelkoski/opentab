@@ -28,28 +28,29 @@ import random
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Dict, Iterator
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from model import OpenTabModel
 from generate_data import SCMDataGenerator
+from model import OpenTabModel
 
 # Optional imports
 try:
     import h5py
+
     HAS_H5PY = True
 except ImportError:
     HAS_H5PY = False
 
 try:
-    from sklearn.datasets import load_iris, load_wine, load_breast_cancer
+    from sklearn.datasets import load_breast_cancer, load_iris, load_wine
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
+
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -58,25 +59,25 @@ except ImportError:
 @dataclass
 class TrainConfig:
     """Training configuration following TabPFN paper."""
-    
+
     # Data generation
     max_train_samples: int = 2048  # Max training samples per dataset
     eval_samples: int = 128  # Fixed validation set size
     max_features: int = 160  # Max features
     max_classes: int = 10  # Max classes for classification
     max_table_cells: int = 75000  # Max cells to avoid memory peaks
-    
+
     # Feature sampling: Beta(k, b) scaled to [1, max_features]
     feature_beta_k: float = 0.95
     feature_beta_b: float = 8.0
-    
+
     # Model architecture
     embedding_size: int = 128
     n_heads: int = 4
     n_layers: int = 6
     mlp_hidden: int = 256
     dropout: float = 0.0
-    
+
     # Training
     n_steps: int = 100000  # Paper uses ~2M steps
     batch_size: int = 64  # Paper uses 64
@@ -85,39 +86,39 @@ class TrainConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 1000
     max_grad_norm: float = 1.0
-    
+
     # Task type
     is_regression: bool = False
     n_bins: int = 64  # For regression
-    
+
     # Logging
     log_interval: int = 100
     eval_interval: int = 1000
     save_interval: int = 10000
-    output_dir: str = 'checkpoints'
-    
+    output_dir: str = "checkpoints"
+
     # Hardware
     seed: int = 42
-    device: str = 'auto'
+    device: str = "auto"
     use_amp: bool = True  # Automatic mixed precision
     compile_model: bool = False  # Use torch.compile() for speedup
-    
+
     def __post_init__(self):
-        if self.device == 'auto':
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if self.device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class OnlineDataGenerator(IterableDataset):
     """
     Generates synthetic datasets on-the-fly following TabPFN paper.
-    
+
     Key aspects:
     - Samples up to 2048 training samples
     - Fixed 128 validation samples
     - Features sampled from Beta distribution
     - Table size limited to 75,000 cells
     """
-    
+
     def __init__(self, config: TrainConfig):
         self.config = config
         self.generator = SCMDataGenerator(
@@ -126,44 +127,40 @@ class OnlineDataGenerator(IterableDataset):
             n_classes_range=(2, config.max_classes),
             is_regression=config.is_regression,
         )
-    
+
     def _sample_n_features(self) -> int:
         """Sample number of features from Beta distribution."""
         # Beta(k, b) scaled to [1, max_features]
-        beta_sample = np.random.beta(
-            self.config.feature_beta_k,
-            self.config.feature_beta_b
-        )
+        beta_sample = np.random.beta(self.config.feature_beta_k, self.config.feature_beta_b)
         n_features = int(1 + beta_sample * (self.config.max_features - 1))
         return max(2, min(n_features, self.config.max_features))
-    
+
     def _sample_n_samples(self, n_features: int) -> int:
         """Sample number of samples, respecting max table size."""
         # Max samples based on cell limit
         max_samples_by_cells = self.config.max_table_cells // n_features
         max_samples = min(
-            self.config.max_train_samples + self.config.eval_samples,
-            max_samples_by_cells
+            self.config.max_train_samples + self.config.eval_samples, max_samples_by_cells
         )
-        
+
         # Sample uniformly
         n_samples = random.randint(
             self.config.eval_samples + 10,  # At least 10 training samples
-            max(self.config.eval_samples + 10, max_samples)
+            max(self.config.eval_samples + 10, max_samples),
         )
         return n_samples
-    
+
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         while True:
             # Sample dataset dimensions
             n_features = self._sample_n_features()
             n_samples = self._sample_n_samples(n_features)
-            
+
             # Train/test split: fixed eval_samples for test
             train_size = n_samples - self.config.eval_samples
             train_size = max(10, train_size)
             n_samples = train_size + self.config.eval_samples
-            
+
             # Generate dataset
             try:
                 dataset = self.generator.generate(
@@ -173,53 +170,53 @@ class OnlineDataGenerator(IterableDataset):
                 )
             except Exception:
                 continue  # Skip failed generations
-            
+
             # Convert to tensors
             X = torch.tensor(dataset.X, dtype=torch.float32)
             if self.config.is_regression:
                 y = torch.tensor(dataset.y, dtype=torch.float32)
             else:
                 y = torch.tensor(dataset.y, dtype=torch.long)
-            
+
             yield {
-                'X': X,
-                'y': y,
-                'train_size': train_size,
-                'n_features': n_features,
-                'n_samples': n_samples,
+                "X": X,
+                "y": y,
+                "train_size": train_size,
+                "n_features": n_features,
+                "n_samples": n_samples,
             }
 
 
 class HDF5Dataset(Dataset):
     """Dataset from pre-generated HDF5 file."""
-    
+
     def __init__(self, path: str):
         if not HAS_H5PY:
             raise ImportError("h5py required: pip install h5py")
         self.path = path
         self.h5_file = None
-        with h5py.File(path, 'r') as f:
-            self.length = f['X'].shape[0]
-    
+        with h5py.File(path, "r") as f:
+            self.length = f["X"].shape[0]
+
     def __len__(self):
         return self.length
-    
+
     def __getitem__(self, idx):
         if self.h5_file is None:
-            self.h5_file = h5py.File(self.path, 'r')
-            
-        X = torch.tensor(self.h5_file['X'][idx], dtype=torch.float32)
-        y = torch.tensor(self.h5_file['y'][idx], dtype=torch.long)
-        train_size = int(self.h5_file['single_eval_pos'][idx])
-        n_features = int(self.h5_file['num_features'][idx])
-        n_samples = int(self.h5_file['num_datapoints'][idx])
-        
+            self.h5_file = h5py.File(self.path, "r")
+
+        X = torch.tensor(self.h5_file["X"][idx], dtype=torch.float32)
+        y = torch.tensor(self.h5_file["y"][idx], dtype=torch.long)
+        train_size = int(self.h5_file["single_eval_pos"][idx])
+        n_features = int(self.h5_file["num_features"][idx])
+        n_samples = int(self.h5_file["num_datapoints"][idx])
+
         return {
-            'X': X,
-            'y': y,
-            'train_size': train_size,
-            'n_features': n_features,
-            'n_samples': n_samples,
+            "X": X,
+            "y": y,
+            "train_size": train_size,
+            "n_features": n_features,
+            "n_samples": n_samples,
         }
 
     def __del__(self):
@@ -229,47 +226,47 @@ class HDF5Dataset(Dataset):
 
 def collate_variable_size(batch):
     """Collate batches with variable sizes by padding."""
-    max_samples = max(b['n_samples'] for b in batch)
-    max_features = max(b['n_features'] for b in batch)
+    max_samples = max(b["n_samples"] for b in batch)
+    max_features = max(b["n_features"] for b in batch)
     batch_size = len(batch)
-    
+
     X_padded = torch.zeros(batch_size, max_samples, max_features)
-    y_padded = torch.zeros(batch_size, max_samples, dtype=batch[0]['y'].dtype)
+    y_padded = torch.zeros(batch_size, max_samples, dtype=batch[0]["y"].dtype)
     train_sizes = torch.zeros(batch_size, dtype=torch.long)
     n_features = torch.zeros(batch_size, dtype=torch.long)
     n_samples = torch.zeros(batch_size, dtype=torch.long)
-    
+
     for i, b in enumerate(batch):
-        ns, nf = b['n_samples'], b['n_features']
-        X_padded[i, :ns, :nf] = b['X'][:ns, :nf]
-        y_padded[i, :ns] = b['y'][:ns]
-        train_sizes[i] = b['train_size']
+        ns, nf = b["n_samples"], b["n_features"]
+        X_padded[i, :ns, :nf] = b["X"][:ns, :nf]
+        y_padded[i, :ns] = b["y"][:ns]
+        train_sizes[i] = b["train_size"]
         n_features[i] = nf
         n_samples[i] = ns
-    
+
     return {
-        'X': X_padded,
-        'y': y_padded,
-        'train_size': train_sizes,
-        'n_features': n_features,
-        'n_samples': n_samples,
+        "X": X_padded,
+        "y": y_padded,
+        "train_size": train_sizes,
+        "n_features": n_features,
+        "n_samples": n_samples,
     }
 
 
 class Trainer:
     """Training loop for OpenTab."""
-    
+
     def __init__(self, config: TrainConfig):
         self.config = config
         self.device = torch.device(config.device)
-        
+
         # Set seeds
         random.seed(config.seed)
         np.random.seed(config.seed)
         torch.manual_seed(config.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.seed)
-        
+
         # Create model
         n_outputs = config.n_bins if config.is_regression else config.max_classes
         self.model = OpenTabModel(
@@ -280,89 +277,94 @@ class Trainer:
             n_outputs=n_outputs,
             dropout=config.dropout,
         ).to(self.device)
-        
+
         # Optionally compile model for faster training (PyTorch 2.0+)
         if config.compile_model:
             print("Compiling model with torch.compile()...")
-            self.model = torch.compile(self.model, mode='default')
-        
+            self.model = torch.compile(self.model, mode="default")
+
         # Optimizer: Adam with weight decay
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        
+
         # Scheduler: linear warmup + cosine annealing
         self.scheduler = self._create_scheduler()
-        
+
         # Mixed precision
         device_type = self.device.type
-        self.autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+        self.autocast_ctx = (
+            torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+            if device_type == "cuda"
+            else nullcontext()
+        )
         self.scaler = None  # Not needed with bfloat16
-        
+
         # Training state
         self.global_step = 0
-        self.best_loss = float('inf')
+        self.best_loss = float("inf")
         self.log_history = []
-        
+
         # Output directory
         os.makedirs(config.output_dir, exist_ok=True)
-        
+
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-    
+
     def _create_scheduler(self):
         """Linear warmup + cosine annealing."""
+
         def lr_lambda(step):
             if step < self.config.warmup_steps:
                 return step / self.config.warmup_steps
-            
+
             progress = (step - self.config.warmup_steps) / (
                 self.config.n_steps - self.config.warmup_steps
             )
             return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
-        
+
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-    
+
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Compute cross-entropy loss on held-out test samples.
-        
+
         Following paper: loss = -log p(y_test | X, y_train)
         """
-        X = batch['X'].to(self.device)
-        y = batch['y'].to(self.device)
-        train_sizes = batch['train_size']
-        n_samples = batch['n_samples']
-        
+        X = batch["X"].to(self.device)
+        y = batch["y"].to(self.device)
+        train_sizes = batch["train_size"]
+        n_samples = batch["n_samples"]
+
         batch_size = X.shape[0]
         losses = []
-        
+
         for i in range(batch_size):
             ts = train_sizes[i].item()
             ns = n_samples[i].item()
-            
+
             if ts >= ns:
                 continue  # No test samples
-            
+
             # Get single item
-            X_i = X[i:i+1, :ns]
-            y_train_i = y[i:i+1, :ts]
-            
+            X_i = X[i : i + 1, :ns]
+            y_train_i = y[i : i + 1, :ts]
+
             # Skip if data is invalid
             if torch.isnan(X_i).any() or torch.isinf(X_i).any():
                 continue
-            
+
             # Forward pass
             logits = self.model(X_i, y_train_i, ts)
-            
+
             if torch.isnan(logits).any():
                 continue
-            
+
             # Compute loss on test samples
-            test_logits = logits[0, :ns - ts]
+            test_logits = logits[0, : ns - ts]
             test_targets = y[i, ts:ns]
-            
+
             if self.config.is_regression:
                 # For regression, use cross-entropy over bins
                 loss = F.cross_entropy(test_logits, test_targets.long())
@@ -371,42 +373,42 @@ class Trainer:
                 # Labels are normalized to 0, 1, ..., n_classes-1 in generate_data.py
                 # so CE will work correctly without truncation
                 loss = F.cross_entropy(test_logits, test_targets)
-            
+
             if not torch.isnan(loss):
                 losses.append(loss)
-        
+
         if losses:
             return torch.stack(losses).mean()
         return torch.tensor(0.0, device=self.device, requires_grad=True)
-    
+
     def train_step(self, batch: Dict[str, torch.Tensor], is_accumulating: bool = False) -> float:
         """
         Single training step with gradient accumulation support.
-        
+
         Args:
             batch: Input batch
             is_accumulating: If True, don't step optimizer (accumulating gradients)
         """
         self.model.train()
-        
+
         # Mixed precision forward pass with bfloat16 autocast
         with self.autocast_ctx:
             loss = self.compute_loss(batch)
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
-        
+
         loss.backward()
-        
+
         if not is_accumulating:
             # Clip gradients and step optimizer only after accumulation is complete
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             self.optimizer.zero_grad()
             self.scheduler.step()
-        
+
         # Return unscaled loss for logging
         return loss.item() * self.config.gradient_accumulation_steps
-    
+
     def train(self, data_path: Optional[str] = None):
         """Main training loop."""
         # Create data loader
@@ -431,24 +433,26 @@ class Trainer:
                 collate_fn=collate_variable_size,
             )
             data_iter = iter(loader)
-        
+
         print(f"Training for {self.config.n_steps} steps")
         print(f"Batch size: {self.config.batch_size}")
         print(f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
-        print(f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
+        print(
+            f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}"
+        )
         print(f"Device: {self.device}")
         print()
-        
+
         # Training loop
         losses = []
         start_time = time.time()
         self.optimizer.zero_grad()  # Initialize gradients
-        
+
         micro_step = 0  # Track micro-steps for gradient accumulation
-        
+
         for step in range(self.config.n_steps):
             accumulated_loss = 0.0
-            
+
             # Gradient accumulation loop
             for accum_step in range(self.config.gradient_accumulation_steps):
                 # Get batch
@@ -457,50 +461,54 @@ class Trainer:
                 except StopIteration:
                     data_iter = iter(loader)
                     batch = next(data_iter)
-                
+
                 # Check if still accumulating (not last micro-step)
-                is_accumulating = (accum_step < self.config.gradient_accumulation_steps - 1)
-                
+                is_accumulating = accum_step < self.config.gradient_accumulation_steps - 1
+
                 # Train step
                 loss = self.train_step(batch, is_accumulating=is_accumulating)
                 accumulated_loss += loss / self.config.gradient_accumulation_steps
-            
+
             losses.append(accumulated_loss)
             self.global_step = step + 1
-            
+
             # Logging
             if self.global_step % self.config.log_interval == 0:
-                avg_loss = np.mean(losses[-self.config.log_interval:])
+                avg_loss = np.mean(losses[-self.config.log_interval :])
                 lr = self.scheduler.get_last_lr()[0]
                 elapsed = time.time() - start_time
                 speed = self.global_step / elapsed
-                
-                print(f"Step {self.global_step}/{self.config.n_steps} | "
-                      f"Loss: {avg_loss:.4f} | LR: {lr:.2e} | "
-                      f"Speed: {speed:.1f} steps/s")
-                
-                self.log_history.append({
-                    'step': self.global_step,
-                    'loss': float(avg_loss),
-                    'lr': float(lr),
-                })
-            
+
+                print(
+                    f"Step {self.global_step}/{self.config.n_steps} | "
+                    f"Loss: {avg_loss:.4f} | LR: {lr:.2e} | "
+                    f"Speed: {speed:.1f} steps/s"
+                )
+
+                self.log_history.append(
+                    {
+                        "step": self.global_step,
+                        "loss": float(avg_loss),
+                        "lr": float(lr),
+                    }
+                )
+
             # Evaluation
             if self.global_step % self.config.eval_interval == 0:
                 self.evaluate()
-            
+
             # Save checkpoint
             if self.global_step % self.config.save_interval == 0:
                 self.save_checkpoint()
-        
+
         # Final save
         self.save_checkpoint(final=True)
         print("Training complete!")
-    
+
     def evaluate(self):
         """Evaluate on fresh synthetic data and sklearn datasets."""
         self.model.eval()
-        
+
         # Create smaller config for evaluation to avoid OOM
         eval_config = TrainConfig(
             max_train_samples=256,  # Smaller for eval
@@ -516,42 +524,42 @@ class Trainer:
             batch_size=1,
             collate_fn=collate_variable_size,
         )
-        
+
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        
+
         with torch.no_grad(), self.autocast_ctx:
             for i, batch in enumerate(eval_loader):
                 if i >= 10:  # Evaluate on 10 batches
                     break
-                
-                X = batch['X'].to(self.device)
-                y = batch['y'].to(self.device)
-                train_sizes = batch['train_size']
-                n_samples_batch = batch['n_samples']
-                
+
+                X = batch["X"].to(self.device)
+                y = batch["y"].to(self.device)
+                train_sizes = batch["train_size"]
+                n_samples_batch = batch["n_samples"]
+
                 for j in range(X.shape[0]):
                     ts = train_sizes[j].item()
                     ns = n_samples_batch[j].item()
-                    
+
                     if ts >= ns:
                         continue
-                    
-                    X_j = X[j:j+1, :ns]
-                    y_train_j = y[j:j+1, :ts]
-                    
+
+                    X_j = X[j : j + 1, :ns]
+                    y_train_j = y[j : j + 1, :ts]
+
                     if torch.isnan(X_j).any():
                         continue
-                    
+
                     logits = self.model(X_j, y_train_j, ts)
-                    
+
                     if torch.isnan(logits).any():
                         continue
-                    
-                    test_logits = logits[0, :ns - ts]
+
+                    test_logits = logits[0, : ns - ts]
                     test_targets = y[j, ts:ns]
-                    
+
                     if not self.config.is_regression:
                         # Labels are normalized, so just compute CE directly
                         loss = F.cross_entropy(test_logits, test_targets)
@@ -559,159 +567,166 @@ class Trainer:
                         total_correct += (preds == test_targets).sum().item()
                     else:
                         loss = F.cross_entropy(test_logits, test_targets.long())
-                    
+
                     total_loss += loss.item() * (ns - ts)
-                    total_samples += (ns - ts)
-        
+                    total_samples += ns - ts
+
         if total_samples > 0:
             avg_loss = total_loss / total_samples
             acc = total_correct / total_samples if not self.config.is_regression else 0
-            
+
             print(f"\n  Eval | Loss: {avg_loss:.4f} | Acc: {acc:.4f}\n")
-            
+
             if avg_loss < self.best_loss:
                 self.best_loss = avg_loss
                 self.save_checkpoint(best=True)
-        
+
         # Evaluate on sklearn datasets
         if HAS_SKLEARN and not self.config.is_regression:
             self._eval_sklearn()
-        
+
         self.model.train()
-    
+
     def _eval_sklearn(self):
         """Quick eval on sklearn datasets."""
         from model import OpenTabClassifier
-        
+
         classifier = OpenTabClassifier(model=self.model, device=str(self.device))
-        
+
         datasets = [
-            ('Iris', load_iris()),
-            ('Wine', load_wine()),
-            ('Breast Cancer', load_breast_cancer()),
+            ("Iris", load_iris()),
+            ("Wine", load_wine()),
+            ("Breast Cancer", load_breast_cancer()),
         ]
-        
+
         results = []
         for name, data in datasets:
             X, y = data.data, data.target
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.3, random_state=42, stratify=y
             )
-            
+
             scaler = StandardScaler()
             X_train = scaler.fit_transform(X_train)
             X_test = scaler.transform(X_test)
-            
+
             classifier.fit(X_train.astype(np.float32), y_train.astype(np.int64))
             y_pred = classifier.predict(X_test.astype(np.float32))
             acc = (y_pred == y_test).mean()
             results.append(f"{name}: {acc:.3f}")
-        
+
         print(f"  sklearn | {' | '.join(results)}\n")
-    
+
     def save_checkpoint(self, best: bool = False, final: bool = False):
         """Save checkpoint."""
         checkpoint = {
-            'model_state': self.model.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'scheduler_state': self.scheduler.state_dict(),
-            'global_step': self.global_step,
-            'best_loss': self.best_loss,
-            'config': {
-                'embedding_size': self.config.embedding_size,
-                'n_heads': self.config.n_heads,
-                'n_layers': self.config.n_layers,
-                'mlp_hidden_size': self.config.mlp_hidden,
-                'max_classes': self.config.max_classes,
-                'max_features': self.config.max_features,
-                'n_bins': self.config.n_bins,
-                'is_regression': self.config.is_regression,
-                'dropout': self.config.dropout,
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+            "global_step": self.global_step,
+            "best_loss": self.best_loss,
+            "config": {
+                "embedding_size": self.config.embedding_size,
+                "n_heads": self.config.n_heads,
+                "n_layers": self.config.n_layers,
+                "mlp_hidden_size": self.config.mlp_hidden,
+                "max_classes": self.config.max_classes,
+                "max_features": self.config.max_features,
+                "n_bins": self.config.n_bins,
+                "is_regression": self.config.is_regression,
+                "dropout": self.config.dropout,
             },
-            'log_history': self.log_history,
+            "log_history": self.log_history,
         }
-        
+
         if best:
-            path = os.path.join(self.config.output_dir, 'best_model.pt')
+            path = os.path.join(self.config.output_dir, "best_model.pt")
         elif final:
-            path = os.path.join(self.config.output_dir, 'final_model.pt')
+            path = os.path.join(self.config.output_dir, "final_model.pt")
         else:
-            path = os.path.join(self.config.output_dir, f'checkpoint_{self.global_step}.pt')
-        
+            path = os.path.join(self.config.output_dir, f"checkpoint_{self.global_step}.pt")
+
         torch.save(checkpoint, path)
         print(f"  Saved: {path}")
-        
+
         # Save log
-        with open(os.path.join(self.config.output_dir, 'log.json'), 'w') as f:
+        with open(os.path.join(self.config.output_dir, "log.json"), "w") as f:
             json.dump(self.log_history, f, indent=2)
-    
+
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state'])
-        self.global_step = checkpoint['global_step']
-        self.best_loss = checkpoint['best_loss']
-        self.log_history = checkpoint.get('log_history', [])
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state"])
+        self.global_step = checkpoint["global_step"]
+        self.best_loss = checkpoint["best_loss"]
+        self.log_history = checkpoint.get("log_history", [])
         print(f"Loaded checkpoint from {path}, step {self.global_step}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train OpenTab')
-    
+    parser = argparse.ArgumentParser(description="Train OpenTab")
+
     # Data
-    parser.add_argument('--data', type=str, default=None, help='HDF5 data path')
-    parser.add_argument('--online', action='store_true', help='Generate data on-the-fly')
-    
+    parser.add_argument("--data", type=str, default=None, help="HDF5 data path")
+    parser.add_argument("--online", action="store_true", help="Generate data on-the-fly")
+
     # Data generation
-    parser.add_argument('--max_train_samples', type=int, default=2048,
-                       help='Max training samples per dataset')
-    parser.add_argument('--eval_samples', type=int, default=128,
-                       help='Fixed validation set size')
-    parser.add_argument('--max_features', type=int, default=160,
-                       help='Max features per dataset')
-    parser.add_argument('--max_table_cells', type=int, default=75000,
-                       help='Max cells to avoid memory peaks')
-    
+    parser.add_argument(
+        "--max_train_samples", type=int, default=2048, help="Max training samples per dataset"
+    )
+    parser.add_argument("--eval_samples", type=int, default=128, help="Fixed validation set size")
+    parser.add_argument("--max_features", type=int, default=160, help="Max features per dataset")
+    parser.add_argument(
+        "--max_table_cells", type=int, default=75000, help="Max cells to avoid memory peaks"
+    )
+
     # Model
-    parser.add_argument('--embedding_size', type=int, default=128)
-    parser.add_argument('--n_heads', type=int, default=4)
-    parser.add_argument('--n_layers', type=int, default=6)
-    parser.add_argument('--mlp_hidden', type=int, default=256)
-    
+    parser.add_argument("--embedding_size", type=int, default=128)
+    parser.add_argument("--n_heads", type=int, default=4)
+    parser.add_argument("--n_layers", type=int, default=6)
+    parser.add_argument("--mlp_hidden", type=int, default=256)
+
     # Training
-    parser.add_argument('--steps', type=int, default=100000)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                       help='Accumulate gradients over N micro-batches')
-    parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--warmup_steps', type=int, default=1000)
-    
+    parser.add_argument("--steps", type=int, default=100000)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients over N micro-batches",
+    )
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup_steps", type=int, default=1000)
+
     # Task
-    parser.add_argument('--regression', action='store_true', help='Train for regression')
-    parser.add_argument('--max_classes', type=int, default=10)
-    parser.add_argument('--n_bins', type=int, default=64, help='Bins for regression')
-    
+    parser.add_argument("--regression", action="store_true", help="Train for regression")
+    parser.add_argument("--max_classes", type=int, default=10)
+    parser.add_argument("--n_bins", type=int, default=64, help="Bins for regression")
+
     # Logging
-    parser.add_argument('--log_interval', type=int, default=100)
-    parser.add_argument('--eval_interval', type=int, default=1000)
-    parser.add_argument('--save_interval', type=int, default=10000)
-    parser.add_argument('--output_dir', type=str, default='checkpoints')
-    
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--eval_interval", type=int, default=1000)
+    parser.add_argument("--save_interval", type=int, default=10000)
+    parser.add_argument("--output_dir", type=str, default="checkpoints")
+
     # Misc
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--compile', action='store_true',
-                       help='Use torch.compile() for ~10-20%% faster training (PyTorch 2.0+)')
-    
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile() for ~10-20%% faster training (PyTorch 2.0+)",
+    )
+
     args = parser.parse_args()
-    
+
     if not args.data and not args.online:
         print("Using online data generation")
         args.online = True
-    
+
     config = TrainConfig(
         max_train_samples=args.max_train_samples,
         eval_samples=args.eval_samples,
@@ -737,14 +752,14 @@ def main():
         device=args.device,
         compile_model=args.compile,
     )
-    
+
     trainer = Trainer(config)
-    
+
     if args.resume:
         trainer.load_checkpoint(args.resume)
-    
+
     trainer.train(args.data)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
